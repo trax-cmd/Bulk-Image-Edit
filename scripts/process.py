@@ -92,7 +92,7 @@ LOGO_PRIOR = (100, 79)
 
 
 LOGOB_PRIOR = (204, 160)          # top-left of the coloured stamp, from the bottom-right corner
-LOGOB_SCALES = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.3)
+LOGOB_SCALES = (1.1, 1.15, 1.2, 1.05, 1.0, 1.25, 1.3, 0.95, 0.9)   # the stamp is always near full size
 
 
 def _masked_match(gray, tpl, mask):
@@ -100,24 +100,43 @@ def _masked_match(gray, tpl, mask):
     return np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
 
 
+def _scaled_mask(mask, scale):
+    th, tw = max(1, round(mask.shape[0] * scale)), max(1, round(mask.shape[1] * scale))
+    return cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST) > 0
+
+
+def _window(img, x, y, m):
+    """Image window under a template mask placed at (x, y); clipped to the frame."""
+    th, tw = m.shape
+    h, w = min(th, img.shape[0] - y), min(tw, img.shape[1] - x)
+    if h <= 0 or w <= 0:
+        return None, None
+    return img[y:y + h, x:x + w], m[:h, :w]
+
+
 def _maroon_fraction(bgr, red_mask_tpl, x, y, scale):
     """Share of the stamp's maroon eye pixels that really are maroon in the image.
 
     Maroon: red well above green, green and blue similar, not bright. Gold and
-    skin tones fail the green-blue balance, white and grey fail the red lift.
+    most metal fail the green-blue balance, white and grey fail the red lift.
+    (Skin passes, which is why a lettering check follows.)
     """
-    th, tw = max(1, round(red_mask_tpl.shape[0] * scale)), max(1, round(red_mask_tpl.shape[1] * scale))
-    m = cv2.resize(red_mask_tpl, (tw, th), interpolation=cv2.INTER_NEAREST) > 0
-    h, w = min(th, bgr.shape[0] - y), min(tw, bgr.shape[1] - x)
-    if h <= 0 or w <= 0:
+    win, m = _window(bgr, x, y, _scaled_mask(red_mask_tpl, scale))
+    if win is None or m.sum() < 60:
         return 0.0
-    win = bgr[y:y + h, x:x + w].astype(int)
-    m = m[:h, :w]
-    if m.sum() < 10:
-        return 0.0
+    win = win.astype(int)
     b, g, r = win[..., 0][m], win[..., 1][m], win[..., 2][m]
-    ok = (r - g > 35) & (np.abs(g - b) < 30) & (r < 235)
+    ok = (r - g >= 28) & (np.abs(g - b) <= 22) & (r >= 100) & (r <= 205)
     return float(ok.mean())
+
+
+def _lettering_contrast(gray, letter_mask_tpl, blank_mask_tpl, x, y, scale):
+    """How much darker the 'TraxNYC' lettering is than the stamp's blank areas, in the image."""
+    wl, ml = _window(gray, x, y, _scaled_mask(letter_mask_tpl, scale))
+    wb, mb = _window(gray, x, y, _scaled_mask(blank_mask_tpl, scale))
+    if wl is None or wb is None or ml.sum() < 30 or mb.sum() < 30:
+        return 0.0
+    return float(wb[mb].mean() - wl[ml].mean())
 
 
 def _top_k(res, k, th, tw):
@@ -132,19 +151,25 @@ def _top_k(res, k, th, tw):
     return out
 
 
-def find_logo_b(bgr, tpl_bgr, thresh=0.38, color_thresh=0.5, prior_thresh=0.25, topk=3):
-    """Locate the large coloured TraxNYC stamp at any scale, anywhere in the lower
-    60% of the frame, including stamps cut off by the frame edge.
+def find_logo_b(bgr, tpl_bgr, thresh=0.25, big_thresh=0.5, color_thresh=0.6, letter_thresh=18, topk=5):
+    """Locate the large coloured TraxNYC stamp anywhere in the lower 60% of the
+    frame, including stamps cut off by the frame edge.
 
-    A candidate counts only if its matching score clears `thresh` AND the eye
-    region is actually maroon in the image (`color_thresh`), which rejects
-    look-alike patterns on gold pieces. Returns (x, y, scale, score) or None.
+    A candidate counts only if its matching score clears the threshold AND the
+    eye region is maroon in the image AND the lettering is darker than the
+    stamp's blank areas. Frames 900px or wider are modern photography that
+    never carries the stamp, so they need a much higher score.
+    Returns (x, y, scale, score) or None.
     """
     H, W = bgr.shape[:2]
+    if W >= 900:
+        thresh = big_thresh
     tgray = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
     core = (tgray < 235).astype(np.uint8) * 255          # eye + lettering, no soft shadow
     tb, tg_, tr = cv2.split(tpl_bgr.astype(int))
     red_mask = ((tr - np.maximum(tg_, tb)) > 40).astype(np.uint8)
+    letters = ((tgray < 120) & (red_mask == 0)).astype(np.uint8)
+    blank = (tgray > 250).astype(np.uint8)
     pad = int(tgray.shape[1] * 0.6)
     y_off = max(0, int(H * 0.4) - pad)
     padded = cv2.copyMakeBorder(bgr[y_off:], 0, pad, pad, pad, cv2.BORDER_CONSTANT, value=(255, 255, 255))
@@ -152,37 +177,25 @@ def find_logo_b(bgr, tpl_bgr, thresh=0.38, color_thresh=0.5, prior_thresh=0.25, 
     best = None
     for sc in LOGOB_SCALES:
         th, tw = round(tgray.shape[0] * sc), round(tgray.shape[1] * sc)
-        if th >= gray.shape[0] or tw >= gray.shape[1] or th < 8:
+        if th >= gray.shape[0] or tw >= gray.shape[1]:
             continue
         t = cv2.resize(tgray, (tw, th), interpolation=cv2.INTER_AREA)
         m = cv2.resize(core, (tw, th), interpolation=cv2.INTER_NEAREST)
-        if m.sum() == 0:
-            continue
         res = _masked_match(gray, t, m)
         for x, y, score in _top_k(res, topk, th, tw):
             if score < thresh:
                 continue
-            if _maroon_fraction(padded, red_mask, x, y, sc) < color_thresh:
+            maroon = _maroon_fraction(padded, red_mask, x, y, sc)
+            if maroon < color_thresh or (score < 0.35 and maroon < 0.8):
+                continue
+            if _lettering_contrast(gray, letters, blank, x, y, sc) < letter_thresh:
                 continue
             if best is None or score > best[3]:
                 best = (x - pad, y + y_off, sc, score)
-    if best is None:
-        # usual bottom-right placement at full size, lower bar but colour still required
-        px, py = W - LOGOB_PRIOR[0], H - LOGOB_PRIOR[1]
-        if px >= 0 and py >= 0:
-            th, tw = tgray.shape
-            r = 8
-            x0, y0 = max(0, px - r), max(0, py - r)
-            win = cv2.cvtColor(bgr[y0:py + th + r, x0:px + tw + r], cv2.COLOR_BGR2GRAY)
-            if win.shape[0] >= th and win.shape[1] >= tw:
-                res = _masked_match(win, tgray, core)
-                _, mx, _, (wx, wy) = cv2.minMaxLoc(res)
-                if mx >= prior_thresh and _maroon_fraction(bgr, red_mask, x0 + wx, y0 + wy, 1.0) >= color_thresh:
-                    best = (x0 + wx, y0 + wy, 1.0, float(mx))
     return best
 
 
-def stamp_mask(shape, tpl_bgr, x, y, scale, white_thresh=253, dilate=6):
+def stamp_mask(shape, tpl_bgr, x, y, scale, white_thresh=253, dilate=None):
     """Binary mask of where the coloured stamp sits, including its soft shadow.
 
     The shadow fades to within a couple of levels of white, so the threshold
@@ -192,6 +205,8 @@ def stamp_mask(shape, tpl_bgr, x, y, scale, white_thresh=253, dilate=6):
     th, tw = round(tpl_bgr.shape[0] * scale), round(tpl_bgr.shape[1] * scale)
     t = cv2.resize(tpl_bgr, (tw, th), interpolation=cv2.INTER_AREA)
     m = (t.min(axis=2) < white_thresh).astype(np.uint8) * 255
+    if dilate is None:
+        dilate = round(6 * scale) + 2
     if dilate:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1))
         m = cv2.dilate(m, k)
@@ -226,11 +241,15 @@ def clear_background_ghost(bgr, mask, ring=6, light=238, white=(255, 255, 255)):
     return out
 
 
-def over_product(bgr, mask, ring=4, dark=235):
-    """Fraction of pixels in a thin ring just outside `mask` that are not background."""
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring + 1, 2 * ring + 1))
-    outer = cv2.dilate(mask, k)
-    ringpx = (outer > 0) & (mask == 0)
+def over_product(bgr, mask, inner=3, outer=8, dark=220):
+    """Fraction of pixels in a ring 3-8px outside `mask` that are not background.
+
+    The ring starts a few pixels out so the stamp's own faint shadow does not
+    count, and `dark` tolerates slightly off-white backgrounds.
+    """
+    ki = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * inner + 1, 2 * inner + 1))
+    ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * outer + 1, 2 * outer + 1))
+    ringpx = (cv2.dilate(mask, ko) > 0) & (cv2.dilate(mask, ki) == 0)
     if ringpx.sum() == 0:
         return 0.0
     return float(((bgr.min(axis=2) < dark) & ringpx).sum() / ringpx.sum())
@@ -245,7 +264,7 @@ def find_logo(bgr, logo_tpl, thresh=0.45, stroke_thresh=250, prior_thresh=0.25):
     return match_all(gray, logo_tpl, thresh, mask=stroke, prior=prior, prior_thresh=prior_thresh)
 
 
-def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1):
+def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2):
     if not hits:
         return bgr, None
     th, tw = logo_tpl.shape
@@ -261,15 +280,56 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1):
     return cv2.inpaint(bgr, mask, 2, cv2.INPAINT_TELEA), mask
 
 
-def remove_ruler_text(bgr, text_tpl, thresh=0.45, pad=80, margin=2):
-    th, tw = text_tpl.shape
+RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 0.9, 0.8)
+
+
+def remove_ruler_text(bgr, text_tpl, thresh=0.45, part_thresh=0.52, pad=120, margin=3):
+    """Find every 'TraxNYC' word printed on a ruler, at any of the sizes the
+    catalogue uses, and fill it with the ruler's own background.
+
+    Words cut off by the frame edge are found with partial templates (the
+    left part of the word must touch the right edge, the right part the left
+    edge, the top part the bottom edge), which only count when they do touch
+    that edge.
+    """
+    H, W = bgr.shape[:2]
     padded = cv2.copyMakeBorder(bgr, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(255, 255, 255))
     gray = cv2.cvtColor(padded, cv2.COLOR_BGR2GRAY)
-    hits = match_all(gray, text_tpl, thresh)
+    band_top = int(H * 0.3) + pad                      # rulers sit in the lower part of the frame
+    sub = gray[band_top:, :]
+    TH, TW = text_tpl.shape
+    parts = [  # (name, template slice, acceptance test on the hit box in padded coords)
+        ("full", text_tpl, lambda x, y, h, w: True),
+        ("left", text_tpl[:, : int(TW * 0.45)], lambda x, y, h, w: x + w >= W + pad - 4),
+        ("left30", text_tpl[:, : int(TW * 0.3)], lambda x, y, h, w: x + w >= W + pad - 4),
+        ("right", text_tpl[:, int(TW * 0.55):], lambda x, y, h, w: x <= pad + 4),
+        ("top", text_tpl[: int(TH * 0.55), :], lambda x, y, h, w: y + h >= H + pad - 4),
+        ("top35", text_tpl[: int(TH * 0.35), :], lambda x, y, h, w: y + h >= H + pad - 4),
+    ]
+    hits = []
+    for sc in RULER_TEXT_SCALES:
+        for name, part, accept in parts:
+            th, tw = round(part.shape[0] * sc), round(part.shape[1] * sc)
+            if th >= sub.shape[0] or tw >= sub.shape[1] or th < 6 or tw < 10:
+                continue
+            t = cv2.resize(part, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC)
+            res = cv2.matchTemplate(sub, t, cv2.TM_CCOEFF_NORMED)
+            need = thresh if name == "full" else (part_thresh + 0.08 if name in ("left30", "top35") else part_thresh)
+            for x, y, score in _top_k(res, 6, th, tw):
+                yy = y + band_top
+                if score >= need and accept(x, yy, th, tw):
+                    hits.append((x, yy, sc, score, th, tw, name))
     if not hits:
         return bgr, []
+    hits.sort(key=lambda h: (h[6] != "full", -h[3]))   # full-word hits win over partials
+    kept = []
+    for h in hits:
+        x, y, sc, score, th, tw, name = h
+        if any(x < k[0] + k[5] and x + tw > k[0] and y < k[1] + k[4] and y + th > k[1] for k in kept):
+            continue
+        kept.append(h)
     out = padded.copy()
-    for x, y, _ in hits:
+    for x, y, sc, score, th, tw, name in kept:
         y0, y1 = max(0, y - margin), y + th + margin
         x0, x1 = max(0, x - margin), x + tw + margin
         box = out[y0:y1, x0:x1]
@@ -277,7 +337,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.45, pad=80, margin=2):
         fill = np.median(light, axis=0) if len(light) else np.array([255, 255, 255])
         out[y0:y1, x0:x1] = fill.astype(np.uint8)
     out = out[pad:-pad, pad:-pad]
-    return out, [(x - pad, y - pad, s) for x, y, s in hits]
+    return out, [(x - pad, y - pad, round(score, 2)) for x, y, sc, score, th, tw, name in kept]
 
 
 def upscale(img: Image.Image, size: int) -> Image.Image:

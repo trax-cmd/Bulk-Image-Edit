@@ -40,7 +40,10 @@ def main() -> int:
                      "position": int(m["position"]), "folder": folder, "output_file": out.name,
                      "exists": out.exists(), "source_width": m["width"], "source_height": m["height"],
                      "flags": fl, "overlap": ov, "old_source_url": m["source_url"]})
-    rows.sort(key=lambda r: (int(r["item_number"]), r["position"]))
+    def item_key(r):
+        n = r["item_number"]
+        return (0, int(n)) if n.isdigit() else (1, n)
+    rows.sort(key=lambda r: (item_key(r), r["position"]))
     with open(dest / "image_manifest.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
         w.writeheader()

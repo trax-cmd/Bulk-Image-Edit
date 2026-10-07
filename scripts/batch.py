@@ -37,7 +37,8 @@ def _templates():
         _TPL["logo"] = load_template(ROOT / "assets/trax_logo_template.png")
         _TPL["text"] = load_template(ROOT / "assets/trax_ruler_text_template.png")
         _TPL["logo_b"] = cv2.imread(str(ROOT / "assets/trax_logoB_template.png"), cv2.IMREAD_COLOR)
-    return _TPL["logo"], _TPL["text"], _TPL["logo_b"]
+        _TPL["lettering"] = load_template(ROOT / "assets/trax_logoB_lettering.png")
+    return _TPL["logo"], _TPL["text"], _TPL["logo_b"], _TPL["lettering"]
 
 
 def work(args):
@@ -46,8 +47,8 @@ def work(args):
            "stamp_a": "", "stamp_a_score": "", "stamp_b": "", "stamp_b_scale": "", "stamp_b_score": "",
            "ruler_words": 0, "overlap": "", "flags": "", "error": ""}
     try:
-        logo_tpl, text_tpl, logo_b_tpl = _templates()
-        orig, final, info = process_image(src, logo_tpl, text_tpl, 1200, logo_b_tpl=logo_b_tpl)
+        logo_tpl, text_tpl, logo_b_tpl, lettering_tpl = _templates()
+        orig, final, info = process_image(src, logo_tpl, text_tpl, 1200, logo_b_tpl=logo_b_tpl, lettering_tpl=lettering_tpl)
         save_image(final, dst, "jpg")
         row["width"], row["height"] = orig.size
         flags = []

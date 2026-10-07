@@ -108,12 +108,15 @@ def _scaled_mask(mask, scale):
 
 
 def _window(img, x, y, m):
-    """Image window under a template mask placed at (x, y); clipped to the frame."""
+    """Image window under a template mask placed at (x, y); clipped to the frame
+    on every side (x or y may be negative when the stamp is cut off)."""
     th, tw = m.shape
-    h, w = min(th, img.shape[0] - y), min(tw, img.shape[1] - x)
+    sx, sy = max(0, -x), max(0, -y)
+    x, y = max(0, x), max(0, y)
+    h, w = min(th - sy, img.shape[0] - y), min(tw - sx, img.shape[1] - x)
     if h <= 0 or w <= 0:
         return None, None
-    return img[y:y + h, x:x + w], m[:h, :w]
+    return img[y:y + h, x:x + w], m[sy:sy + h, sx:sx + w]
 
 
 def _maroon_fraction(bgr, red_mask_tpl, x, y, scale):
@@ -153,7 +156,7 @@ def _top_k(res, k, th, tw):
     return out
 
 
-def find_logo_b(bgr, tpl_bgr, thresh=0.25, big_thresh=0.5, color_thresh=0.6, letter_thresh=18, topk=5):
+def _find_logo_b_masked(bgr, tpl_bgr, thresh=0.45, big_thresh=0.6, color_thresh=0.8, letter_thresh=18, topk=5):
     """Locate the large coloured TraxNYC stamp anywhere in the lower 60% of the
     frame, including stamps cut off by the frame edge.
 
@@ -218,6 +221,80 @@ def find_logo_b(bgr, tpl_bgr, thresh=0.25, big_thresh=0.5, color_thresh=0.6, let
         if mx > score:
             score, sc, x, y = float(mx), s2, x0 + wx - pad, y0 + wy + y_off
     return (x, y, sc, score)
+
+
+LETTERING_OFFSET = (100, 114)     # top-left of the lettering band inside the stamp template
+LETTERING_SCALES = (1.0, 1.1, 1.2, 1.3, 0.9, 1.4, 1.5, 1.6, 1.7)
+
+
+def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.68, big_thresh=0.85, color_thresh=0.5, topk=3):
+    """Locate the large coloured TraxNYC stamp via its 'TraxNYC' lettering.
+
+    The lettering is opaque and carries its own white halo, so it looks the
+    same on any background and gives a reliable position and scale (the
+    masked whole-stamp match rewards oversized templates). Each candidate is
+    confirmed by the maroon colour of the eye region, then the scale is
+    refined. Falls back to the masked whole-stamp match when nothing is
+    found. Returns (x, y, scale, score) or None.
+    """
+    H, W = bgr.shape[:2]
+    if W >= 900:
+        thresh = big_thresh
+    gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    tb, tg_, tr = cv2.split(tpl_bgr.astype(int))
+    red_mask = ((tr - np.maximum(tg_, tb)) > 40).astype(np.uint8)
+    pad = int(lettering_tpl.shape[1] * 1.2)
+    y_off = max(0, int(H * 0.35) - pad)
+    gray = cv2.copyMakeBorder(gray_full[y_off:], 0, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+    padded = cv2.copyMakeBorder(bgr[y_off:], 0, pad, pad, pad, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+    ox, oy = LETTERING_OFFSET
+
+    def stamp_origin(lx, ly, sc):
+        return round(lx - ox * sc), round(ly - oy * sc)
+
+    def score_at(sc, win_x0=None, win_y0=None, win=None):
+        th, tw = round(lettering_tpl.shape[0] * sc), round(lettering_tpl.shape[1] * sc)
+        g = gray if win is None else win
+        if th >= g.shape[0] or tw >= g.shape[1] or th < 6:
+            return None
+        t = cv2.resize(lettering_tpl, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC)
+        return cv2.matchTemplate(g, t, cv2.TM_CCOEFF_NORMED), th, tw
+
+    best = None
+    for sc in LETTERING_SCALES:
+        r = score_at(sc)
+        if r is None:
+            continue
+        res, th, tw = r
+        for lx, ly, score in _top_k(res, topk, th, tw):
+            if score < thresh:
+                continue
+            sx, sy = stamp_origin(lx, ly, sc)
+            if _maroon_fraction(padded, red_mask, sx, sy, sc) < color_thresh:
+                continue
+            if best is None or score > best[3]:
+                best = (lx, ly, sc, score)
+    if best is None:
+        return _find_logo_b_masked(bgr, tpl_bgr)
+    lx, ly, sc, score = best
+    base = sc
+    cx, cy = lx + lettering_tpl.shape[1] * sc / 2, ly + lettering_tpl.shape[0] * sc / 2
+    for ds in (-0.05, -0.025, 0.025, 0.05):
+        s2 = base + ds
+        th, tw = round(lettering_tpl.shape[0] * s2), round(lettering_tpl.shape[1] * s2)
+        x2, y2 = round(cx - tw / 2), round(cy - th / 2)
+        r = 4
+        x0, y0 = max(0, x2 - r), max(0, y2 - r)
+        win = gray[y0:y2 + th + r, x0:x2 + tw + r]
+        rr = score_at(s2, win=win)
+        if rr is None:
+            continue
+        res, th, tw = rr
+        _, mx, _, (wx, wy) = cv2.minMaxLoc(res)
+        if mx > score:
+            score, sc, lx, ly = float(mx), s2, x0 + wx, y0 + wy
+    sx, sy = stamp_origin(lx, ly, sc)
+    return (sx - pad, sy + y_off, sc, float(score))
 
 
 def stamp_mask(shape, tpl_bgr, x, y, scale, white_thresh=253, dilate=None):
@@ -333,7 +410,22 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2):
     return cv2.inpaint(bgr, mask, 2, cv2.INPAINT_TELEA), mask
 
 
-RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3, 0.9, 0.8)
+RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3)
+
+
+def _looks_like_ticks(gray_win, dark=200):
+    """True when a candidate window is a row of ruler tick marks rather than
+    lettering: ticks are many tall, thin bars (median blob height over 60% of
+    the window, width under 7%), letters are shorter and wider blobs."""
+    d = (gray_win < dark).astype(np.uint8)
+    n, _, st, _ = cv2.connectedComponentsWithStats(d, connectivity=8)
+    st = st[1:]
+    st = st[st[:, 4] >= max(3, 0.002 * gray_win.size)]
+    if len(st) < 6:
+        return False
+    med_h = float(np.median(st[:, 3]) / gray_win.shape[0])
+    med_w = float(np.median(st[:, 2]) / gray_win.shape[1])
+    return med_h > 0.58 and med_w < 0.07
 
 
 def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, margin=3):
@@ -370,7 +462,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             need = thresh if name == "full" else (part_thresh + 0.08 if name in ("left30", "top35") else part_thresh)
             for x, y, score in _top_k(res, 6, th, tw):
                 yy = y + band_top
-                if score >= need and accept(x, yy, th, tw):
+                if score >= need and accept(x, yy, th, tw) and not _looks_like_ticks(gray[yy:yy + th, x:x + tw]):
                     hits.append((x, yy, sc, score, th, tw, name))
     if not hits:
         return bgr, []
@@ -407,7 +499,7 @@ def upscale(img: Image.Image, size: int) -> Image.Image:
     return canvas
 
 
-def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = False, logo_b_tpl=None):
+def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = False, logo_b_tpl=None, lettering_tpl=None):
     """Run the whole pipeline on one file.
 
     Returns (original, final, info) where info has: logo_hits, text_hits,
@@ -417,7 +509,7 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
     pil = to_rgb(ImageOps.exif_transpose(Image.open(path)))
     bgr = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
     logo_hits = find_logo(bgr, logo_tpl)                     # detect on the untouched image
-    logo_b = find_logo_b(bgr, logo_b_tpl) if logo_b_tpl is not None else None
+    logo_b = find_logo_b(bgr, logo_b_tpl, lettering_tpl) if logo_b_tpl is not None else None
     bgr, text_hits = remove_ruler_text(bgr, text_tpl)
     overlap = 0.0
     bgr, mask_a = remove_logo(bgr, logo_tpl, logo_hits)
@@ -453,12 +545,14 @@ def main() -> int:
     ap.add_argument("--logo", default=str(root / "assets/trax_logo_template.png"))
     ap.add_argument("--ruler-text", default=str(root / "assets/trax_ruler_text_template.png"))
     ap.add_argument("--logo-b", default=str(root / "assets/trax_logoB_template.png"))
+    ap.add_argument("--lettering", default=str(root / "assets/trax_logoB_lettering.png"))
     ap.add_argument("--no-upscale", action="store_true", help="only strip branding, keep size")
     a = ap.parse_args()
 
     logo_tpl = load_template(Path(a.logo))
     text_tpl = load_template(Path(a.ruler_text))
     logo_b_tpl = cv2.imread(a.logo_b, cv2.IMREAD_COLOR)
+    lettering_tpl = load_template(Path(a.lettering))
     in_dir, out_dir = Path(a.input_dir), Path(a.output_dir)
     files = sorted(p for p in in_dir.rglob("*") if p.suffix.lower() in EXTS)
     if not files:
@@ -466,7 +560,7 @@ def main() -> int:
         return 1
 
     for p in files:
-        pil, final, info = process_image(p, logo_tpl, text_tpl, a.size, a.no_upscale, logo_b_tpl)
+        pil, final, info = process_image(p, logo_tpl, text_tpl, a.size, a.no_upscale, logo_b_tpl, lettering_tpl)
         logo_hits, text_hits = info["logo_hits"], info["text_hits"]
 
         rel = p.relative_to(in_dir).with_suffix("." + a.format)

@@ -410,7 +410,7 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2):
     return cv2.inpaint(bgr, mask, 2, cv2.INPAINT_TELEA), mask
 
 
-RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3)
+RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3, 0.9, 0.8)
 
 
 def _looks_like_ticks(gray_win, dark=200):

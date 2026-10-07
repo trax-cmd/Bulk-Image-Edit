@@ -182,8 +182,13 @@ def find_logo_b(bgr, tpl_bgr, thresh=0.38, color_thresh=0.5, prior_thresh=0.25, 
     return best
 
 
-def stamp_mask(shape, tpl_bgr, x, y, scale, white_thresh=248, dilate=3):
-    """Binary mask of where the coloured stamp (incl. its soft shadow) sits."""
+def stamp_mask(shape, tpl_bgr, x, y, scale, white_thresh=253, dilate=6):
+    """Binary mask of where the coloured stamp sits, including its soft shadow.
+
+    The shadow fades to within a couple of levels of white, so the threshold
+    is generous and the mask is dilated well past the visible edge; a stamp
+    left half-removed shows as a grey ghost.
+    """
     th, tw = round(tpl_bgr.shape[0] * scale), round(tpl_bgr.shape[1] * scale)
     t = cv2.resize(tpl_bgr, (tw, th), interpolation=cv2.INTER_AREA)
     m = (t.min(axis=2) < white_thresh).astype(np.uint8) * 255
@@ -197,6 +202,28 @@ def stamp_mask(shape, tpl_bgr, x, y, scale, white_thresh=248, dilate=3):
     if h > 0 and w > 0:
         mask[y:y + h, x:x + w] = m[sy:sy + h, sx:sx + w]
     return mask
+
+
+def clear_background_ghost(bgr, mask, ring=6, light=238, white=(255, 255, 255)):
+    """After inpainting a stamp on plain background, flatten any leftover grey.
+
+    Looks at a ring just outside the mask: where that ring is background
+    (light), the inpainted patch is set to the ring's own colour so no tint
+    propagates in. Where the ring touches the product the inpaint is kept.
+    """
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring + 1, 2 * ring + 1))
+    outer = cv2.dilate(mask, k)
+    ringpx = (outer > 0) & (mask == 0)
+    if ringpx.sum() == 0:
+        return bgr
+    ring_vals = bgr[ringpx]
+    bg_share = float((ring_vals.min(axis=1) >= light).mean())
+    if bg_share < 0.98:
+        return bgr                                   # stamp touched the product; leave inpaint as is
+    fill = np.median(ring_vals, axis=0)
+    out = bgr.copy()
+    out[mask > 0] = fill.astype(np.uint8)
+    return out
 
 
 def over_product(bgr, mask, ring=4, dark=235):
@@ -288,6 +315,7 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
         mask_b = stamp_mask(bgr.shape, logo_b_tpl, x, y, sc)
         overlap = max(overlap, over_product(bgr, mask_b))
         bgr = cv2.inpaint(bgr, mask_b, 3, cv2.INPAINT_TELEA)
+        bgr = clear_background_ghost(bgr, mask_b)
     clean = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
     final = clean if no_upscale else upscale(clean, size)
     info = {"logo_hits": logo_hits, "text_hits": text_hits, "logo_b": logo_b, "overlap": round(overlap, 3)}

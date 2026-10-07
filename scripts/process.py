@@ -274,6 +274,31 @@ def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.68, big_thresh=0.85, color
                 continue
             if best is None or score > best[3]:
                 best = (lx, ly, sc, score)
+    if best is None and W < 900:
+        # second pass (catalogue frames only): the stamp's usual corner
+        # placements, lower bar, colour still required
+        for px_off, dx_lo, dx_hi in ((W - LOGOB_PRIOR[0], -40, 40), (-100, -30, 30)):
+            for sc in (0.9, 1.0, 1.1, 1.2, 1.3):
+                th, tw = round(lettering_tpl.shape[0] * sc), round(lettering_tpl.shape[1] * sc)
+                lx_c = px_off + ox * sc + pad
+                ly_c = (H - LOGOB_PRIOR[1]) + oy * sc - y_off
+                x0, x1 = int(lx_c + dx_lo), int(lx_c + tw + dx_hi)
+                y0, y1 = int(ly_c - 30), int(ly_c + th + 30)
+                x0, y0 = max(0, x0), max(0, y0)
+                win = gray[y0:y1, x0:x1]
+                if win.shape[0] <= th or win.shape[1] <= tw:
+                    continue
+                t = cv2.resize(lettering_tpl, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC)
+                res = cv2.matchTemplate(win, t, cv2.TM_CCOEFF_NORMED)
+                _, mx, _, (wx, wy) = cv2.minMaxLoc(res)
+                if mx < 0.55:
+                    continue
+                lx, ly = x0 + wx, y0 + wy
+                sx, sy = stamp_origin(lx, ly, sc)
+                if _maroon_fraction(padded, red_mask, sx, sy, sc) < 0.25:
+                    continue
+                if best is None or mx > best[3]:
+                    best = (lx, ly, sc, float(mx))
     if best is None:
         return _find_logo_b_masked(bgr, tpl_bgr)
     lx, ly, sc, score = best

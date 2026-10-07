@@ -61,6 +61,8 @@ def match_all(gray, tpl, thresh, mask=None, prior=None, prior_thresh=0.15):
     score there clears `prior_thresh`.
     """
     th, tw = tpl.shape
+    if gray.shape[0] <= th or gray.shape[1] <= tw:
+        return []
     if mask is not None:
         res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED, mask=mask)
         res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
@@ -331,10 +333,10 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2):
     return cv2.inpaint(bgr, mask, 2, cv2.INPAINT_TELEA), mask
 
 
-RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 0.9, 0.8)
+RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3, 0.9, 0.8)
 
 
-def remove_ruler_text(bgr, text_tpl, thresh=0.45, part_thresh=0.52, pad=120, margin=3):
+def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, margin=3):
     """Find every 'TraxNYC' word printed on a ruler, at any of the sizes the
     catalogue uses, and fill it with the ruler's own background.
 

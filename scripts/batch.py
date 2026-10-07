@@ -10,8 +10,9 @@ gets a row in the report CSV with what was detected, plus a `flags` column
 naming anything a human should spot-check:
   no_stamp            neither stamp found (fine if the source had none)
   weak_stamp_a/b      stamp accepted on position only or with a low score
-  stamp_over_product  the removed stamp's border touched the product, so the
-                      inpainted patch deserves a look (`overlap` = fraction)
+  stamp_over_product  a good part of the removed stamp's border touched the
+                      product (overlap >= 0.3), so the inpainted patch needs a look
+  stamp_near_product  the stamp brushed the product (overlap 0.1-0.3); usually fine
   ruler_text          TraxNYC words removed from a ruler shot (count in column)
   error               the file could not be processed (message in `error`)
 Already-finished outputs are skipped, so the run can be resumed.
@@ -63,8 +64,10 @@ def work(args):
         if not logo_hits and not lb:
             flags.append("no_stamp")
         row["overlap"] = info["overlap"]
-        if info["overlap"] > 0.1:
+        if info["overlap"] >= 0.3:
             flags.append("stamp_over_product")
+        elif info["overlap"] >= 0.1:
+            flags.append("stamp_near_product")
         row["ruler_words"] = len(text_hits)
         if text_hits:
             flags.append("ruler_text")

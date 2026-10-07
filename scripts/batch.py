@@ -8,11 +8,12 @@ Input layout: <input_root>/<item folder>/<image files>. Output mirrors it as
 <output_root>/<item folder>/<name>.jpg (always 1200x1200 JPEG). Every file
 gets a row in the report CSV with what was detected, plus a `flags` column
 naming anything a human should spot-check:
-  no_logo         no corner stamp found (fine if the source had none)
-  weak_logo       stamp accepted on position only or with a low score
-  odd_size        source is not the usual 500x380 catalogue frame
-  ruler_text      TraxNYC words removed from a ruler shot (count in column)
-  error           the file could not be processed (message in `error`)
+  no_stamp            neither stamp found (fine if the source had none)
+  weak_stamp_a/b      stamp accepted on position only or with a low score
+  stamp_over_product  the removed stamp's border touched the product, so the
+                      inpainted patch deserves a look (`overlap` = fraction)
+  ruler_text          TraxNYC words removed from a ruler shot (count in column)
+  error               the file could not be processed (message in `error`)
 Already-finished outputs are skipped, so the run can be resumed.
 """
 import argparse
@@ -23,6 +24,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cv2  # noqa: E402
 from process import EXTS, load_template, process_image, save_image  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,28 +35,36 @@ def _templates():
     if not _TPL:
         _TPL["logo"] = load_template(ROOT / "assets/trax_logo_template.png")
         _TPL["text"] = load_template(ROOT / "assets/trax_ruler_text_template.png")
-    return _TPL["logo"], _TPL["text"]
+        _TPL["logo_b"] = cv2.imread(str(ROOT / "assets/trax_logoB_template.png"), cv2.IMREAD_COLOR)
+    return _TPL["logo"], _TPL["text"], _TPL["logo_b"]
 
 
 def work(args):
     src, dst = args
     row = {"item": src.parent.name, "file": src.name, "output": str(dst), "width": "", "height": "",
-           "logo_x": "", "logo_y": "", "logo_score": "", "ruler_words": 0, "flags": "", "error": ""}
+           "stamp_a": "", "stamp_a_score": "", "stamp_b": "", "stamp_b_scale": "", "stamp_b_score": "",
+           "ruler_words": 0, "overlap": "", "flags": "", "error": ""}
     try:
-        logo_tpl, text_tpl = _templates()
-        orig, final, logo_hits, text_hits = process_image(src, logo_tpl, text_tpl, 1200)
+        logo_tpl, text_tpl, logo_b_tpl = _templates()
+        orig, final, info = process_image(src, logo_tpl, text_tpl, 1200, logo_b_tpl=logo_b_tpl)
         save_image(final, dst, "jpg")
         row["width"], row["height"] = orig.size
         flags = []
+        logo_hits, text_hits, lb = info["logo_hits"], info["text_hits"], info["logo_b"]
         if logo_hits:
             x, y, s = max(logo_hits, key=lambda h: h[2])
-            row["logo_x"], row["logo_y"], row["logo_score"] = x, y, round(s, 3)
+            row["stamp_a"], row["stamp_a_score"] = f"{x},{y}", round(s, 3)
             if s < 0.5:
-                flags.append("weak_logo")
-        else:
-            flags.append("no_logo")
-        if orig.size != (500, 380):
-            flags.append("odd_size")
+                flags.append("weak_stamp_a")
+        if lb:
+            row["stamp_b"], row["stamp_b_scale"], row["stamp_b_score"] = f"{lb[0]},{lb[1]}", lb[2], round(lb[3], 3)
+            if lb[3] < 0.5:
+                flags.append("weak_stamp_b")
+        if not logo_hits and not lb:
+            flags.append("no_stamp")
+        row["overlap"] = info["overlap"]
+        if info["overlap"] > 0.1:
+            flags.append("stamp_over_product")
         row["ruler_words"] = len(text_hits)
         if text_hits:
             flags.append("ruler_text")
@@ -94,8 +104,8 @@ def main() -> int:
     if not jobs:
         return 0
 
-    fields = ["item", "file", "output", "width", "height", "logo_x", "logo_y", "logo_score",
-              "ruler_words", "flags", "error"]
+    fields = ["item", "file", "output", "width", "height", "stamp_a", "stamp_a_score", "stamp_b",
+              "stamp_b_scale", "stamp_b_score", "ruler_words", "overlap", "flags", "error"]
     new = not report.exists()
     report.parent.mkdir(parents=True, exist_ok=True)
     done = 0

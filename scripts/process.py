@@ -408,6 +408,12 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, light=215):
     core = around(235, round(2.5 * scale) + 1)
     full = around(253, round(6 * scale) + 2)
     halo = (full > 0) & (core == 0)
+    # shadow-tinted product pixels under the translucent parts are rebuilt
+    # too (a model fill reproduces the metal; a paper fill would not)
+    if _INPAINTER is not None:
+        tinted = halo & (bgr.min(axis=2) < light)
+        core = core | (tinted.astype(np.uint8) * 255)
+        halo = (full > 0) & (core == 0)
     out = _inpaint_core(bgr, core, 3)
     out = clear_background_ghost(out, core)
     # background fill colour: light pixels in a ring just outside the full mask

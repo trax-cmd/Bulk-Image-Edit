@@ -92,7 +92,7 @@ LOGO_PRIOR = (100, 79)
 
 
 LOGOB_PRIOR = (204, 160)          # top-left of the coloured stamp, from the bottom-right corner
-LOGOB_SCALES = (1.1, 1.15, 1.2, 1.05, 1.0, 1.25, 1.3, 0.95, 0.9)   # the stamp is always near full size
+LOGOB_SCALES = (1.1, 1.15, 1.2, 1.05, 1.0, 1.25, 1.3, 1.4, 1.5, 0.95, 0.9)   # the stamp is always near full size
 
 
 def _masked_match(gray, tpl, mask):
@@ -192,7 +192,30 @@ def find_logo_b(bgr, tpl_bgr, thresh=0.25, big_thresh=0.5, color_thresh=0.6, let
                 continue
             if best is None or score > best[3]:
                 best = (x - pad, y + y_off, sc, score)
-    return best
+    if best is None:
+        return None
+    # refine the scale around the best hit, keeping the stamp centre fixed
+    x, y, sc, score = best
+    base = sc
+    cx, cy = x + tgray.shape[1] * sc / 2, y + tgray.shape[0] * sc / 2
+    for ds in (-0.075, -0.05, -0.025, 0.025, 0.05, 0.075):
+        s2 = base + ds
+        th, tw = round(tgray.shape[0] * s2), round(tgray.shape[1] * s2)
+        if th < 8 or tw < 8:
+            continue
+        x2, y2 = round(cx - tw / 2) + pad, round(cy - th / 2) - y_off
+        r = 4
+        x0, y0 = max(0, x2 - r), max(0, y2 - r)
+        win = gray[y0:y2 + th + r, x0:x2 + tw + r]
+        if win.shape[0] < th or win.shape[1] < tw:
+            continue
+        t = cv2.resize(tgray, (tw, th), interpolation=cv2.INTER_AREA)
+        m = cv2.resize(core, (tw, th), interpolation=cv2.INTER_NEAREST)
+        res = _masked_match(win, t, m)
+        _, mx, _, (wx, wy) = cv2.minMaxLoc(res)
+        if mx > score:
+            score, sc, x, y = float(mx), s2, x0 + wx - pad, y0 + wy + y_off
+    return (x, y, sc, score)
 
 
 def stamp_mask(shape, tpl_bgr, x, y, scale, white_thresh=253, dilate=None):
@@ -219,7 +242,7 @@ def stamp_mask(shape, tpl_bgr, x, y, scale, white_thresh=253, dilate=None):
     return mask
 
 
-def clear_background_ghost(bgr, mask, ring=6, light=238, white=(255, 255, 255)):
+def clear_background_ghost(bgr, mask, ring=6, light=238):
     """After inpainting a stamp on plain background, flatten any leftover grey.
 
     Looks at a ring just outside the mask: where that ring is background
@@ -232,13 +255,41 @@ def clear_background_ghost(bgr, mask, ring=6, light=238, white=(255, 255, 255)):
     if ringpx.sum() == 0:
         return bgr
     ring_vals = bgr[ringpx]
-    bg_share = float((ring_vals.min(axis=1) >= light).mean())
-    if bg_share < 0.98:
+    if float((ring_vals.min(axis=1) >= light).mean()) < 0.98:
         return bgr                                   # stamp touched the product; leave inpaint as is
-    fill = np.median(ring_vals, axis=0)
     out = bgr.copy()
-    out[mask > 0] = fill.astype(np.uint8)
+    out[mask > 0] = np.median(ring_vals, axis=0).astype(np.uint8)
     return out
+
+
+def remove_stamp_b(bgr, tpl_bgr, x, y, scale, light=215):
+    """Remove the coloured stamp with as little collateral damage as possible.
+
+    Core (eye, lettering, dense shadow) is always inpainted. The faint outer
+    shadow is only flattened on pixels that are themselves background, so a
+    product the stamp touches keeps its detail. Returns (image, core mask).
+    """
+    def around(white, dil):
+        cx, cy = x + tpl_bgr.shape[1] * scale / 2, y + tpl_bgr.shape[0] * scale / 2
+        m = np.zeros(bgr.shape[:2], np.uint8)
+        for s2 in (scale * 0.94, scale, scale * 1.06):
+            tw, th = tpl_bgr.shape[1] * s2, tpl_bgr.shape[0] * s2
+            m |= stamp_mask(bgr.shape, tpl_bgr, round(cx - tw / 2), round(cy - th / 2), s2, white_thresh=white, dilate=dil)
+        return m
+    core = around(235, round(2.5 * scale) + 1)
+    full = around(253, round(6 * scale) + 2)
+    halo = (full > 0) & (core == 0)
+    out = cv2.inpaint(bgr, core, 3, cv2.INPAINT_TELEA)
+    out = clear_background_ghost(out, core)
+    # background fill colour: light pixels in a ring just outside the full mask
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    ringpx = (cv2.dilate(full, k) > 0) & (full == 0)
+    ring_vals = bgr[ringpx]
+    ring_light = ring_vals[ring_vals.min(axis=1) >= light]
+    fill = np.median(ring_light, axis=0).astype(np.uint8) if len(ring_light) else np.array([255, 255, 255], np.uint8)
+    bg_px = halo & (bgr.min(axis=2) >= light)
+    out[bg_px] = fill
+    return out, core
 
 
 def over_product(bgr, mask, inner=3, outer=8, dark=220):
@@ -372,10 +423,9 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
         overlap = max(overlap, over_product(bgr, mask_a))
     if logo_b is not None:
         x, y, sc, _ = logo_b
-        mask_b = stamp_mask(bgr.shape, logo_b_tpl, x, y, sc)
-        overlap = max(overlap, over_product(bgr, mask_b))
-        bgr = cv2.inpaint(bgr, mask_b, 3, cv2.INPAINT_TELEA)
-        bgr = clear_background_ghost(bgr, mask_b)
+        before = bgr
+        bgr, core_b = remove_stamp_b(bgr, logo_b_tpl, x, y, sc)
+        overlap = max(overlap, over_product(before, core_b))
     clean = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
     final = clean if no_upscale else upscale(clean, size)
     info = {"logo_hits": logo_hits, "text_hits": text_hits, "logo_b": logo_b, "overlap": round(overlap, 3)}

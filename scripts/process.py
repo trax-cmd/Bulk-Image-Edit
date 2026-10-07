@@ -462,8 +462,13 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             need = thresh if name == "full" else (part_thresh + 0.08 if name in ("left30", "top35") else part_thresh)
             for x, y, score in _top_k(res, 6, th, tw):
                 yy = y + band_top
-                if score >= need and accept(x, yy, th, tw) and not _looks_like_ticks(gray[yy:yy + th, x:x + tw]):
-                    hits.append((x, yy, sc, score, th, tw, name))
+                if score < need or not accept(x, yy, th, tw):
+                    continue
+                # letter tops of a bottom-cut word are thin strokes too, so the
+                # tick test only applies to candidates that show whole letters
+                if name not in ("top", "top35") and _looks_like_ticks(gray[yy:yy + th, x:x + tw]):
+                    continue
+                hits.append((x, yy, sc, score, th, tw, name))
     if not hits:
         return bgr, []
     hits.sort(key=lambda h: (h[6] != "full", -h[3]))   # full-word hits win over partials

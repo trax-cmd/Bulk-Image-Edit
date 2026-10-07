@@ -420,19 +420,31 @@ def find_logo(bgr, logo_tpl, thresh=0.45, stroke_thresh=250, prior_thresh=0.25):
 
 
 def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2):
+    """Inpaint the grey stamp's strokes. Over a row of ruler tick marks the
+    mask is the bare strokes with a 1px inpaint radius, so each tick is
+    rebuilt from its own neighbours instead of smeared into a blotch;
+    elsewhere a wider mask also clears the faint halo."""
     if not hits:
         return bgr, None
     th, tw = logo_tpl.shape
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    stroke0 = (logo_tpl < stroke_thresh).astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1))
+    stroke_wide = cv2.dilate(stroke0, k)
     mask = np.zeros(bgr.shape[:2], np.uint8)
-    stroke = (logo_tpl < stroke_thresh).astype(np.uint8) * 255
-    if dilate:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1))
-        stroke = cv2.dilate(stroke, k)
+    on_ticks = False
     for x, y, _ in hits:
         h = min(th, mask.shape[0] - y)
         w = min(tw, mask.shape[1] - x)
+        under = gray[y:y + h, x:x + w]
+        lower = under[int(h * 0.7):]
+        # a dense dark structure under the lettering (ruler ticks and their
+        # baseline, dark metal) is better served by the thin mask
+        ticks = lower.size > 0 and float((lower < 150).mean()) >= 0.25
+        on_ticks = on_ticks or ticks
+        stroke = stroke0 if ticks else stroke_wide
         mask[y:y + h, x:x + w] = np.maximum(mask[y:y + h, x:x + w], stroke[:h, :w])
-    return cv2.inpaint(bgr, mask, 2, cv2.INPAINT_TELEA), mask
+    return cv2.inpaint(bgr, mask, 1 if on_ticks else 2, cv2.INPAINT_TELEA), mask
 
 
 RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3, 0.9, 0.8)
@@ -507,9 +519,17 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
     for x, y, sc, score, th, tw, name in kept:
         y0, y1 = max(0, y - margin), y + th + margin
         x0, x1 = max(0, x - margin), x + tw + margin
-        box = out[y0:y1, x0:x1]
-        light = box[box.min(axis=2) > 235]
-        fill = np.median(light, axis=0) if len(light) else np.array([255, 255, 255])
+        # fill with the ruler's own paper tone: the median of the non-ink
+        # pixels in a ring just outside the word
+        ring = 6
+        ry0, ry1 = max(0, y0 - ring), min(out.shape[0], y1 + ring)
+        rx0, rx1 = max(0, x0 - ring), min(out.shape[1], x1 + ring)
+        region = padded[ry0:ry1, rx0:rx1]
+        inner = np.zeros(region.shape[:2], bool)
+        inner[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = True
+        ringpx = region[~inner]
+        ringpx = ringpx[ringpx.min(axis=1) > 170]
+        fill = np.median(ringpx, axis=0) if len(ringpx) >= 20 else np.array([255, 255, 255])
         out[y0:y1, x0:x1] = fill.astype(np.uint8)
     out = out[pad:-pad, pad:-pad]
     return out, [(x - pad, y - pad, round(score, 2)) for x, y, sc, score, th, tw, name in kept]

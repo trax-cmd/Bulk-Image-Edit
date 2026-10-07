@@ -15,10 +15,18 @@ torch.set_num_threads(max(1, torch.get_num_threads()))
 
 
 class Lama:
-    def __init__(self, weights: str, context: int = 96, min_side: int = 256):
+    def __init__(self, weights: str, context: int = 96, min_side: int = 256,
+                 full_image_max_side: int = 1024, grow: int = 4):
+        """context/min_side: crop around the mask for large frames.
+        full_image_max_side: frames up to this size are given to the model
+        whole, which lets it continue the product's structure correctly.
+        grow: dilate the mask by this many pixels so stamp edge pixels, whose
+        colour is a blend of stamp and product, are rebuilt too."""
         self.model = torch.jit.load(weights, map_location="cpu").eval()
         self.context = context
         self.min_side = min_side
+        self.full_image_max_side = full_image_max_side
+        self.grow = grow
 
     def _run(self, bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
@@ -36,10 +44,18 @@ class Lama:
         return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
     def __call__(self, bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        if self.grow:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * self.grow + 1, 2 * self.grow + 1))
+            mask = cv2.dilate(mask, k)
         ys, xs = np.where(mask > 0)
         if len(ys) == 0:
             return bgr
         H, W = mask.shape
+        if max(H, W) <= self.full_image_max_side:
+            res = self._run(bgr, mask)
+            out = bgr.copy()
+            out[mask > 0] = res[mask > 0]
+            return out
         c = self.context
         y0, y1 = max(0, ys.min() - c), min(H, ys.max() + c + 1)
         x0, x1 = max(0, xs.min() - c), min(W, xs.max() + c + 1)

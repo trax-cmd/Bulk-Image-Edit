@@ -366,6 +366,31 @@ def clear_background_ghost(bgr, mask, ring=6, light=238):
     return out
 
 
+_INPAINTER = None
+
+
+def set_inpainter(fn):
+    """fn(bgr, mask_uint8) -> bgr. Used for the stamp core instead of OpenCV's
+    Telea fill (which smears textured metal). None restores the default."""
+    global _INPAINTER
+    _INPAINTER = fn
+
+
+def _inpaint_core(bgr, mask, radius=3):
+    if _INPAINTER is not None and mask.any():
+        return _INPAINTER(bgr, mask)
+    return cv2.inpaint(bgr, mask, radius, cv2.INPAINT_TELEA)
+
+
+def lama_inpainter(weights=None):
+    """Build a LaMa-based inpainter (see lama.py); weights default to
+    $LAMA_WEIGHTS or models/big-lama.pt next to the repo."""
+    import os
+    from lama import Lama
+    weights = weights or os.environ.get("LAMA_WEIGHTS") or str(Path(__file__).resolve().parent.parent / "models/big-lama.pt")
+    return Lama(weights)
+
+
 def remove_stamp_b(bgr, tpl_bgr, x, y, scale, light=215):
     """Remove the coloured stamp with as little collateral damage as possible.
 
@@ -383,7 +408,7 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, light=215):
     core = around(235, round(2.5 * scale) + 1)
     full = around(253, round(6 * scale) + 2)
     halo = (full > 0) & (core == 0)
-    out = cv2.inpaint(bgr, core, 3, cv2.INPAINT_TELEA)
+    out = _inpaint_core(bgr, core, 3)
     out = clear_background_ghost(out, core)
     # background fill colour: light pixels in a ring just outside the full mask
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
@@ -444,6 +469,8 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2):
         on_ticks = on_ticks or ticks
         stroke = stroke0 if ticks else stroke_wide
         mask[y:y + h, x:x + w] = np.maximum(mask[y:y + h, x:x + w], stroke[:h, :w])
+    if _INPAINTER is not None and not on_ticks:
+        return _INPAINTER(bgr, mask), mask
     return cv2.inpaint(bgr, mask, 1 if on_ticks else 2, cv2.INPAINT_TELEA), mask
 
 
@@ -597,7 +624,10 @@ def main() -> int:
     ap.add_argument("--logo-b", default=str(root / "assets/trax_logoB_template.png"))
     ap.add_argument("--lettering", default=str(root / "assets/trax_logoB_lettering.png"))
     ap.add_argument("--no-upscale", action="store_true", help="only strip branding, keep size")
+    ap.add_argument("--lama", action="store_true", help="use the LaMa model to rebuild what was under a stamp")
     a = ap.parse_args()
+    if a.lama:
+        set_inpainter(lama_inpainter())
 
     logo_tpl = load_template(Path(a.logo))
     text_tpl = load_template(Path(a.ruler_text))

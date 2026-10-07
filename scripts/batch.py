@@ -26,14 +26,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cv2  # noqa: E402
-from process import EXTS, load_template, process_image, save_image  # noqa: E402
+from process import EXTS, load_template, process_image, save_image, set_inpainter, lama_inpainter  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 _TPL = {}
 
 
+_LAMA = {"on": False}
+
+
 def _templates():
-    if not _TPL:
+    if _LAMA["on"] and "inpainter" not in _TPL:
+        _TPL["inpainter"] = lama_inpainter()
+        set_inpainter(_TPL["inpainter"])
+    if not _TPL or "logo" not in _TPL:
         _TPL["logo"] = load_template(ROOT / "assets/trax_logo_template.png")
         _TPL["text"] = load_template(ROOT / "assets/trax_ruler_text_template.png")
         _TPL["logo_b"] = cv2.imread(str(ROOT / "assets/trax_logoB_template.png"), cv2.IMREAD_COLOR)
@@ -88,15 +94,23 @@ def main() -> int:
     ap.add_argument("--report", default=None)
     ap.add_argument("--only", default=None, help="process just this item folder")
     ap.add_argument("--limit", type=int, default=None, help="stop after N files")
+    ap.add_argument("--lama", action="store_true", help="use the LaMa model to rebuild what was under a stamp")
+    ap.add_argument("--list", default=None, help="CSV with item,file columns: process only these")
     a = ap.parse_args()
+    _LAMA["on"] = a.lama
 
     in_root, out_root = Path(a.input_root), Path(a.output_root)
     report = Path(a.report) if a.report else out_root / "report.csv"
+    wanted = None
+    if a.list:
+        wanted = {(r["item"], r["file"]) for r in csv.DictReader(open(a.list))}
     jobs = []
     for src in sorted(in_root.rglob("*")):
         if src.suffix.lower() not in EXTS or not src.is_file():
             continue
         if a.only and src.parent.name != a.only:
+            continue
+        if wanted is not None and (src.parent.name, src.name) not in wanted:
             continue
         dst = out_root / src.relative_to(in_root).with_suffix(".jpg")
         if dst.exists():

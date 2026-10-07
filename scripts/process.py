@@ -30,6 +30,16 @@ from upscale import EXTS, border_color  # noqa: E402
 from PIL import ImageFilter, ImageOps  # noqa: E402
 
 
+def to_rgb(img: Image.Image) -> Image.Image:
+    """Flatten any transparency onto white; return an RGB image."""
+    if img.mode in ("RGBA", "LA", "P"):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        return bg
+    return img.convert("RGB")
+
+
 def load_template(path: Path):
     t = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if t is None:
@@ -132,6 +142,26 @@ def upscale(img: Image.Image, size: int) -> Image.Image:
     return canvas
 
 
+def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = False):
+    """Run the whole pipeline on one file. Returns (original, final, logo_hits, text_hits)."""
+    pil = to_rgb(ImageOps.exif_transpose(Image.open(path)))
+    bgr = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
+    logo_hits = find_logo(bgr, logo_tpl)       # detect on the untouched image
+    bgr, text_hits = remove_ruler_text(bgr, text_tpl)
+    bgr = remove_logo(bgr, logo_tpl, logo_hits)
+    clean = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    final = clean if no_upscale else upscale(clean, size)
+    return pil, final, logo_hits, text_hits
+
+
+def save_image(img: Image.Image, dst: Path, fmt: str, quality: int = 92) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "png":
+        img.save(dst, "PNG", optimize=True)
+    else:
+        img.save(dst, "JPEG", quality=quality, optimize=True, progressive=True, subsampling=0)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("input_dir")
@@ -165,12 +195,7 @@ def main() -> int:
         final = clean if a.no_upscale else upscale(clean, a.size)
 
         rel = p.relative_to(in_dir).with_suffix("." + a.format)
-        dst = out_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if a.format == "png":
-            final.save(dst, "PNG", optimize=True)
-        else:
-            final.save(dst, "JPEG", quality=a.quality, optimize=True, progressive=True, subsampling=0)
+        save_image(final, out_dir / rel, a.format, a.quality)
         lg = ", ".join(f"({x},{y}) {s:.2f}" for x, y, s in logo_hits) or "none"
         tx = ", ".join(f"({x},{y}) {s:.2f}" for x, y, s in text_hits) or "none"
         print(f"{rel}: {pil.size[0]}x{pil.size[1]} -> {final.size[0]}x{final.size[1]} | logo: {lg} | ruler text: {tx}")

@@ -1016,18 +1016,31 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             # the template puts them. A digit merged with the letters by the
             # closing is told from them this way; the paper-like pixels the
             # closing added next to the letters are not part of it
-            flow = (comp & ~glyph_w).astype(np.uint8)
+            # the flow runs through the shape's own ink and gaps of up to
+            # two pixels (a pave piece's bright stones), not through the
+            # wider bridges the closing laid between the letters and a tick
+            # or digit nearby: those would carry a misplaced letter edge
+            # into the body
+            # ... and only through clearly dark pixels: a ruler's paper shades
+            # by more than the non-paper margin across a window, and that
+            # shading must not carry the flow from a tick to a letter
+            dark_w = (gray_w < fill_gray - 30).astype(np.uint8)
+            tight = cv2.morphologyEx(dark_w, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
+            flow = (comp & tight & ~glyph_w).astype(np.uint8)
             _, flab = cv2.connectedComponents(flow, connectivity=8)
             ids = np.unique(flab[outside & (flow > 0)])
             reach = np.isin(flab, ids[ids > 0]) & (flow > 0)
             reach_body = reach & ((nonpaper > 0) | (tpl3_w == 0))
+            outside_dark = outside & (dark_w > 0)
             if like_out > 0.5:
                 # the product is of the ink's own colour (or a black digit
                 # over black letters): colour cannot tell them apart. The
                 # ink on and just around the template's glyph shapes, away
                 # from the shape's own body, is rebuilt by the model; the
                 # rest is kept
-                body = cv2.dilate((outside | reach_body).astype(np.uint8), k7) > 0
+                # (one pixel of margin: letters right against the product are
+                # the model's to rebuild, or they stay as stray marks)
+                body = cv2.dilate((outside_dark | reach_body).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
                 hole = comp & zone & (cv2.dilate(glyph_w.astype(np.uint8), k7) > 0) & (gray_w < fill_gray - 1) & ~body
                 prot_w |= comp & ~hole
                 touch_w |= hole
@@ -1098,8 +1111,9 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 gm_new[:, x0 - nx0:x1 - nx0] = gm
                 gm_new[:, ex0 - nx0:ex1 - nx0] |= close
                 pr_new = protect_wide[y0 - cy0:y1 - cy0, nx0 - cx0:nx1 - cx0].copy()
-                tch_new = np.zeros((bh, nx1 - nx0), np.uint8)
-                tch_new[:, x0 - nx0:x1 - nx0] = touch
+                # what the model must rebuild in the extension too (a
+                # product over the letters beyond the partial template)
+                tch_new = (touch_w[y0 - cy0:y1 - cy0, nx0 - cx0:nx1 - cx0] & ~pr_new).astype(np.uint8) * 255
                 ti_new = np.zeros((bh, nx1 - nx0), np.uint8)
                 ti_new[:, x0 - nx0:x1 - nx0] = tpl_ink
                 ti_new[:, ex0 - nx0:ex1 - nx0] = 255
@@ -1117,7 +1131,10 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         # clean paper only: not the letters' halo, which would pull the fill
         # a few levels down into a faint ghost of the word
         halo = cv2.dilate(gm_reg.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
-        wgt = ((reg_g > fill_gray - 6) & ~halo & inside).astype(np.float32)
+        # (the paper's own darker grain counts, or the fill comes out a
+        # shade lighter than the paper around it and the word shows as a
+        # faint light ghost)
+        wgt = ((reg_g > fill_gray - 15) & ~halo & inside).astype(np.float32)
         local = None
         for ksz in (15, 31, 61):
             den = cv2.blur(wgt, (ksz, ksz))
@@ -1135,7 +1152,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         resid = (reg - local)[py_, px_] if len(py_) else np.zeros((1, 3), np.float32)
         rng = np.random.default_rng(int(x) * 7919 + int(y))
         gy, gx = np.where(gm)
-        pick = 0.6 * np.clip(resid[rng.integers(0, len(resid), size=len(gy))], -4, 4)
+        pick = 0.8 * np.clip(resid[rng.integers(0, len(resid), size=len(gy))], -6, 6)
         sub_local = local[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0]
         box = out[y0:y1, x0:x1]
         box[gy, gx] = np.clip(sub_local[gy, gx] + pick, 0, 255).astype(np.uint8)

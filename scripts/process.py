@@ -974,6 +974,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         prot_w = np.zeros(blobs.shape, bool)
         touch_w = np.zeros(blobs.shape, bool)
+        prod_w = np.zeros(blobs.shape, bool)   # the product (or digit) itself
         word_touched = False
         if letter_colour is not None:
             # a letter pixel is the ink seen through some amount of
@@ -1044,6 +1045,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 hole = comp & zone & (cv2.dilate(glyph_w.astype(np.uint8), k7) > 0) & (gray_w < fill_gray - 1) & ~body
                 prot_w |= comp & ~hole
                 touch_w |= hole
+                prod_w |= outside_dark | reach_body
                 word_touched = word_touched or int((comp & zone & ~body).sum()) > 40
                 continue
             # a product of another colour over the word: its own-coloured
@@ -1082,7 +1084,17 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             mend = comp & zone & band & glyph9 & loose & near & ~ink_sure & ~reach_body
             touch_w |= mend
             prot_w |= (outside | near | reach_body) & ~ink_sure & ~mend
+            prod_w |= (outside & (dark_w > 0)) | core | reach_body
             word_touched = word_touched or int(((near | reach_body) & zone & band & glyph9).sum()) > 40
+        # the model is only needed where the letters meet the product: away
+        # from it the paper fill is exact, and the model's paper comes out
+        # faintly mottled
+        near_prod = cv2.dilate(prod_w.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+        nt, tlab = cv2.connectedComponents(touch_w.astype(np.uint8), connectivity=8)
+        keep_t = np.zeros(nt, bool)
+        keep_t[np.unique(tlab[near_prod & touch_w])] = True
+        keep_t[0] = False
+        touch_w &= keep_t[tlab]
         protect_wide = prot_w
         protect = protect_wide[y0 - cy0:y1 - cy0, x0 - cx0:x1 - cx0]
         touch = (touch_w[y0 - cy0:y1 - cy0, x0 - cx0:x1 - cx0] & ~protect).astype(np.uint8) * 255

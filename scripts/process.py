@@ -630,12 +630,12 @@ def find_logo(bgr, logo_tpl, thresh=0.45, stroke_thresh=250, prior_thresh=0.25):
     return match_all(gray, logo_tpl, thresh, mask=stroke, prior=prior, prior_thresh=prior_thresh)
 
 
-def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2, logo_tpl_bgr=None):
+def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1, logo_tpl_bgr=None):
     """Remove the grey stamp.
 
     - On plain background: paper fill of the strokes.
-    - Next to or over a product: the model rebuilds the strokes, grown 2px,
-      on a 2x upsampled crop.
+    - Next to or over a product: the model rebuilds the strokes, grown 1px,
+      on a 2x upsampled crop (grown 2px it flattened pave facets).
       (An arithmetic undo of this stamp was tried and rejected: its strokes
       are one or two pixels wide, so after JPEG compression the undo leaves
       ghost letters on smooth metal and speckle on pave.)
@@ -679,7 +679,7 @@ def _looks_like_ticks(gray_win, dark=200):
     return med_h > 0.58 and med_w < 0.07
 
 
-def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, margin=3):
+def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, margin=4):
     """Find every 'TraxNYC' word printed on a ruler, at any of the sizes the
     catalogue uses, and fill it with the ruler's own background.
 
@@ -788,24 +788,89 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         if any(x < k[0] + k[5] and x + tw > k[0] and y < k[1] + k[4] and y + th > k[1] for k in kept):
             continue
         kept.append(h)
-    out = padded.copy()
+    # refine each word's size and position: the size steps above are coarse,
+    # and a word matched a size step too small leaves the bottoms of its
+    # letters outside the fill
+    refined = []
     for x, y, sc, score, th, tw, name, part in kept:
+        best = (score, x, y, sc, th, tw)
+        for f_ in (0.92, 0.95, 0.97, 1.0, 1.03, 1.06, 1.09, 1.12):
+            s2 = sc * f_
+            th2, tw2 = round(part.shape[0] * s2), round(part.shape[1] * s2)
+            wy0, wy1 = max(0, y - 6), min(gray.shape[0], y + th2 + 6)
+            wx0, wx1 = max(0, x - 6), min(gray.shape[1], x + tw2 + 6)
+            win = gray[wy0:wy1, wx0:wx1]
+            if win.shape[0] <= th2 or win.shape[1] <= tw2 or th2 < 6 or tw2 < 10:
+                continue
+            t2 = cv2.resize(part, (tw2, th2), interpolation=cv2.INTER_AREA if s2 < 1 else cv2.INTER_CUBIC)
+            res = cv2.matchTemplate(win, t2, cv2.TM_CCOEFF_NORMED)
+            _, mx, _, loc = cv2.minMaxLoc(res)
+            if mx > best[0] + 0.01:
+                best = (float(mx), wx0 + loc[0], wy0 + loc[1], s2, th2, tw2)
+        refined.append((best[1], best[2], best[3], best[0], best[4], best[5], name, part))
+    kept = refined
+    out = padded.copy()
+
+    def paper_tone(x, y, th, tw):
+        """The ruler's own paper tone around a word: the median of the light
+        pixels in a ring around it (real image pixels only, never the white
+        padding). Returns (box, ring box, fill colour, fill grey)."""
         y0, y1 = max(0, y - margin), min(out.shape[0], y + th + margin)
         x0, x1 = max(0, x - margin), min(out.shape[1], x + tw + margin)
-        # the ruler's own paper tone: light pixels in a ring around the word
         ring = 6
         ry0, ry1 = max(0, y0 - ring), min(out.shape[0], y1 + ring)
         rx0, rx1 = max(0, x0 - ring), min(out.shape[1], x1 + ring)
         region = padded[ry0:ry1, rx0:rx1]
         inner = np.zeros(region.shape[:2], bool)
         inner[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = True
-        # only real image pixels count as paper, never the white padding
         inside = np.zeros(region.shape[:2], bool)
         inside[max(0, pad - ry0):max(0, H + pad - ry0), max(0, pad - rx0):max(0, W + pad - rx0)] = True
         ringpx = region[~inner & inside]
         ringpx = ringpx[ringpx.min(axis=1) > 170]
         fill = (np.median(ringpx, axis=0) if len(ringpx) >= 20 else np.array([255, 255, 255])).astype(np.uint8)
         fill_gray = float(0.114 * fill[0] + 0.587 * fill[1] + 0.299 * fill[2])
+        return (x0, y0, x1, y1), (rx0, ry0, rx1, ry1), fill, fill_gray
+
+    def ink_per_letter(x, y, th, tw, part, sc, fill_gray):
+        """The median colour of the darker third of each of the word's
+        letters, as placed by the template (one entry per letter found)."""
+        t = (cv2.resize(part, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC) < 200).astype(np.uint8) * 255
+        gh, gw = min(th, gray.shape[0] - y), min(tw, gray.shape[1] - x)
+        if gh <= 0 or gw <= 0:
+            return []
+        g_win = gray[y:y + gh, x:x + gw]
+        b_win = padded[y:y + gh, x:x + gw]
+        core = cv2.dilate(t[:gh, :gw], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        ng, glab = cv2.connectedComponents(core, connectivity=8)
+        strong = g_win < fill_gray - 35
+        cols = []
+        for gi in range(1, ng):
+            m = (glab == gi) & strong
+            if m.sum() < 8:
+                continue
+            darker = m & (g_win <= np.percentile(g_win[m], 35))
+            cols.append(np.median(b_win[darker if darker.sum() >= 4 else m], axis=0))
+        return cols
+
+    # The words of one ruler share one ink colour. Every word gives an
+    # estimate; the word whose letters agree best wins (a product lying
+    # over some letters of a word spoils that word's estimate)
+    ink_global, best = None, (-1, -1)
+    for x, y, sc, score, th, tw, name, part in kept:
+        _, _, fill_, fg_ = paper_tone(x, y, th, tw)
+        cols = ink_per_letter(x, y, th, tw, part, sc, fg_)
+        if len(cols) < 2:
+            continue
+        arr = np.array(cols)
+        med = np.median(arr, axis=0)
+        close_ = np.abs(arr - med).max(axis=1) <= 35
+        key = (int(close_.sum()), len(cols))
+        if key > best:
+            best, ink_global = key, np.median(arr[close_], axis=0) if close_.sum() >= 2 else med
+
+    touched_words = []
+    for x, y, sc, score, th, tw, name, part in kept:
+        (x0, y0, x1, y1), (rx0, ry0, rx1, ry1), fill, fill_gray = paper_tone(x, y, th, tw)
         # the glyphs are taken from the image itself (ink darker than the
         # paper inside the word's box), so a word printed a little larger or
         # a pixel off from the template is still covered entirely; the
@@ -828,47 +893,142 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         g_ = 2 * (5 + int(round(0.03 * tw))) + 1
         tpl_ink = cv2.dilate(tpl_ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g_, g_)))
         strong = (box_g < fill_gray - 35).astype(np.uint8)
-        n, lab, st, _ = cv2.connectedComponentsWithStats(strong, connectivity=8)
-        protect = np.zeros(strong.shape, np.uint8)
-        touch = np.zeros(strong.shape, np.uint8)
-        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        # the letters' own colour, from strokes that stand free of anything
-        # reaching in from above
-        free = (strong > 0) & (tpl_ink3 > 0)
+        # Everything that is not paper, in a window around the word, grouped
+        # into shapes. A shape that lives inside the word's zone is letters;
+        # a shape that reaches beyond it is a ruler digit or tick coming in
+        # from above, or a product lying over the word. Inside such a shape
+        # the letters' own colour tells the letters from the product.
+        ftw_ = round(TW * sc)
+        cy0, cy1 = max(0, y0 - 24), min(gray.shape[0], y1 + 24)
+        cx0, cx1 = max(0, x0 - ftw_ - 24), min(gray.shape[1], x1 + ftw_ + 24)
+        gray_w = gray[cy0:cy1, cx0:cx1]
+        bgr_w = padded[cy0:cy1, cx0:cx1].astype(np.int16)
+        nonpaper = (gray_w < fill_gray - 12).astype(np.uint8)
+        blobs = cv2.morphologyEx(nonpaper, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+        n, lab, st, _ = cv2.connectedComponentsWithStats(blobs, connectivity=8)
+        zone = np.zeros(blobs.shape, bool)
+        zy0, zy1 = max(0, y0 - 8 - cy0), min(blobs.shape[0], y1 + 8 - cy0)
+        if name.startswith("left"):
+            zx0, zx1 = max(0, x0 - 12 - cx0), min(blobs.shape[1], x + ftw_ + 12 - cx0)
+        elif name.startswith("right"):
+            zx0, zx1 = max(0, x + tw - ftw_ - 12 - cx0), min(blobs.shape[1], x1 + 12 - cx0)
+        else:
+            zx0, zx1 = max(0, x0 - 12 - cx0), min(blobs.shape[1], x1 + 12 - cx0)
+        zone[zy0:zy1, zx0:zx1] = True
+        tpl3_w = np.zeros(blobs.shape, np.uint8)
+        tpl3_w[y0 - cy0:y1 - cy0, x0 - cx0:x1 - cx0] = tpl_ink3
+        glyph_w = np.zeros(blobs.shape, np.uint8)
+        gh, gw = min(th, blobs.shape[0] - (y - cy0)), min(tw, blobs.shape[1] - (x - cx0))
+        if gh > 0 and gw > 0:
+            glyph_w[y - cy0:y - cy0 + gh, x - cx0:x - cx0 + gw] = t[:gh, :gw]
+        glyph_w = cv2.dilate(glyph_w, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
+        in_frac = np.zeros(n)
         for i in range(1, n):
-            if st[i, 1] == 0:
-                free &= lab != i
-        box_bgr = padded[y0:y1, x0:x1]
-        letter_colour = np.median(box_bgr[free], axis=0) if free.sum() >= 30 else None
-        for i in range(1, n):
-            top, hgt = st[i, 1], st[i, 3]
-            if top != 0 or name.startswith("top"):
-                # (a word cut by the bottom of the frame shows only letter
-                # tops, which touch the box top themselves)
+            comp = lab == i
+            in_frac[i] = float((comp & zone).sum()) / max(1, int(comp.sum()))
+        letters_only = (in_frac >= 0.9)[lab] & (lab > 0)
+        # the ink colour: the median over the letters of each letter's own
+        # median colour (its darker half), so a product lying over a few of
+        # the letters does not pull the estimate towards its own colour
+        glyph_core = np.zeros(blobs.shape, np.uint8)
+        if gh > 0 and gw > 0:
+            glyph_core[y - cy0:y - cy0 + gh, x - cx0:x - cx0 + gw] = t[:gh, :gw]
+        glyph_core = cv2.dilate(glyph_core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        ng, glab = cv2.connectedComponents(glyph_core, connectivity=8)
+        strong_w = gray_w < fill_gray - 35
+        per_letter = []
+        for gi in range(1, ng):
+            gm_ = (glab == gi) & strong_w
+            if gm_.sum() < 8:
                 continue
-            comp = (lab == i).astype(np.uint8) * 255
-            if top + hgt < 0.5 * bh:
-                # a digit's bottom reaching into the box from above
-                protect = np.maximum(protect, comp)
-            else:
-                # something tall reaching in from above: a product lying over
-                # the word. Its pixels away from the letter positions are
-                # kept; the letter strokes attached to it are rebuilt by the
-                # model after the paper fill, so the product keeps a clean
-                # edge where the letters touched it
-                body = cv2.bitwise_and(comp, cv2.bitwise_not(tpl_ink3))
-                if letter_colour is not None:
-                    # inside the letter area, pixels that are not letter
-                    # coloured belong to the product
-                    far = np.abs(box_bgr.astype(np.int16) - letter_colour.astype(np.int16)).max(axis=2) > 45
-                    body = np.maximum(body, cv2.bitwise_and(comp, (far.astype(np.uint8) * 255)))
-                protect = np.maximum(protect, body)
-                near_body = cv2.dilate(body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
-                touch = np.maximum(touch, cv2.bitwise_and(cv2.dilate(cv2.bitwise_and(comp, tpl_ink3), k5), near_body))
-        protect = cv2.dilate(protect, k5) > 0
+            gp = gray_w[gm_]
+            darker = gm_ & (gray_w <= np.percentile(gp, 35))
+            per_letter.append(np.median(bgr_w[darker if darker.sum() >= 4 else gm_], axis=0))
+        letter_colour = np.median(np.array(per_letter), axis=0) if len(per_letter) >= 2 else None
+        if ink_global is not None:
+            letter_colour = ink_global
+        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        prot_w = np.zeros(blobs.shape, bool)
+        touch_w = np.zeros(blobs.shape, bool)
+        word_touched = False
+        if letter_colour is not None:
+            # a letter pixel is the ink seen through some amount of
+            # anti-aliasing: it lies on the line from the paper colour to the
+            # ink colour. A product pixel of another hue does not.
+            paper_v = fill.astype(np.float32)
+            v = letter_colour.astype(np.float32) - paper_v
+            d = bgr_w.astype(np.float32) - paper_v
+            tt = (d * v).sum(axis=2) / max(1.0, float((v * v).sum()))
+            resid = np.sqrt(((d - tt[..., None] * v) ** 2).sum(axis=2))
+            # the tolerance grows with darkness: the darkest pixels of a
+            # letter drift furthest from a line through an estimate
+            dn = np.sqrt((d * d).sum(axis=2))
+            letter_like = (resid <= np.maximum(40.0, 0.2 * dn)) & (tt >= -0.15) & (tt <= 2.2)
+        else:
+            letter_like = np.zeros(blobs.shape, bool)
+        for i in range(1, n):
+            if in_frac[i] >= 0.9:
+                continue
+            comp = lab == i
+            rows = np.where((comp & zone).any(axis=1))[0]
+            from_above = (comp[:zy0] if zy0 > 0 else np.zeros((0, 1), bool)).any()
+            depth = (rows.max() - zy0 + 1) / max(1, zy1 - zy0) if len(rows) else 0.0
+            outside = comp & ~zone
+            # judged on the shape's pixels that are at least half as dark as
+            # the ink (a pave piece's bright stones lie on every ink line)
+            judge = outside & (nonpaper > 0) & (tt > 0.5) if letter_colour is not None else outside
+            like_out = float(letter_like[judge].mean()) if judge.sum() >= 30 else 0.0
+            if (from_above and depth < 0.5) or letter_colour is None:
+                # a digit's or tick's foot: kept whole
+                prot_w |= cv2.dilate(comp.astype(np.uint8), k5) > 0
+                continue
+            word_touched = True
+            if like_out > 0.5:
+                # the product is of the ink's own colour (or a black digit
+                # over black letters): colour cannot tell them apart. The
+                # ink on and just around the template's glyph shapes, within
+                # the letters' own rows and away from the shape's body
+                # outside the zone, is rebuilt by the model; the rest is kept
+                band = np.zeros(blobs.shape, bool)
+                band[max(0, y - 2 - cy0):min(blobs.shape[0], y + th + 2 - cy0), :] = True
+                body = cv2.dilate(outside.astype(np.uint8), k7) > 0
+                hole = comp & zone & band & (cv2.dilate(glyph_w.astype(np.uint8), k7) > 0) & (gray_w < fill_gray - 1) & ~body
+                prot_w |= comp & ~hole
+                touch_w |= hole
+                continue
+            # a product of another colour over the word: its own-coloured
+            # pixels and anything within 3px of them are product, letter-
+            # coloured pixels away from them are letters
+            core = comp & ~letter_like & (nonpaper > 0)
+            # stray ink pixels off the ink line (JPEG colour noise) are not
+            # product: only patches of some size count (a pave piece's thin
+            # dark gaps between stones are long, so they survive)
+            nc, clab, cst, _ = cv2.connectedComponentsWithStats(core.astype(np.uint8), connectivity=8)
+            keep_c = np.zeros(nc, bool)
+            keep_c[1:] = cst[1:, 4] >= 6
+            core = keep_c[clab]
+            near = cv2.dilate(core.astype(np.uint8), k7) > 0
+            # pixels of the ink's colour at least half as dark as the ink are
+            # letters even right against the product
+            ink_sure = comp & zone & letter_like & (tt > 0.5) & (nonpaper > 0) & ~core
+            # ink right against the product takes on some of its colour in
+            # the JPEG: dark pixels roughly on the ink line, on the glyphs,
+            # are rebuilt by the model rather than kept
+            loose = (resid <= np.maximum(60.0, 0.35 * dn)) & (tt > 0.5) & (tt <= 2.2) & (nonpaper > 0)
+            band = np.zeros(blobs.shape, bool)
+            band[max(0, y - 2 - cy0):min(blobs.shape[0], y + th + 2 - cy0), :] = True
+            glyph9 = cv2.dilate(glyph_w.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+            mend = comp & zone & band & glyph9 & loose & near & ~ink_sure
+            touch_w |= mend
+            prot_w |= (outside | near) & ~ink_sure & ~mend
+        protect_wide = prot_w
+        protect = protect_wide[y0 - cy0:y1 - cy0, x0 - cx0:x1 - cx0]
+        touch = (touch_w[y0 - cy0:y1 - cy0, x0 - cx0:x1 - cx0] & ~protect).astype(np.uint8) * 255
+        box_bgr = padded[y0:y1, x0:x1]
         # everything darker than the paper near the letters goes: the ink,
         # its soft edges and the JPEG ringing around it
-        gm = (box_g < fill_gray - 3) & ~protect & (tpl_ink > 0)
+        gm = (box_g < fill_gray - 1) & ~protect & (tpl_ink > 0)
         if name.startswith("left") or name.startswith("right"):
             # a partial that is not at the frame edge may show more letters
             # than its template: fill ink of the same colour as the matched
@@ -878,21 +1038,18 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 ex0, ex1 = x1, min(out.shape[1], x + ftw + margin)
             else:
                 ex0, ex1 = max(0, x + tw - ftw - margin), x0
-            letter_px = padded[y0:y1, x0:x1][strong > 0]
-            if ex1 > ex0 and len(letter_px) >= 20:
-                lc = np.median(letter_px, axis=0)
-                ext = padded[y0:y1, ex0:ex1].astype(np.int16)
+            if ex1 > ex0 and letter_colour is not None:
                 ext_g = gray[y0:y1, ex0:ex1]
-                close = (np.abs(ext - lc.astype(np.int16)).max(axis=2) <= 45) & (ext_g < fill_gray - 20)
+                close = letter_like[y0 - cy0:y1 - cy0, ex0 - cx0:ex1 - cx0] & (ext_g < fill_gray - 20)
                 close = cv2.dilate(close.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
                 close &= ext_g < fill_gray - 5
+                close &= ~protect_wide[y0 - cy0:y1 - cy0, ex0 - cx0:ex1 - cx0]
                 # grow the working box to cover the extension
                 nx0, nx1 = min(x0, ex0), max(x1, ex1)
                 gm_new = np.zeros((bh, nx1 - nx0), bool)
                 gm_new[:, x0 - nx0:x1 - nx0] = gm
                 gm_new[:, ex0 - nx0:ex1 - nx0] |= close
-                pr_new = np.zeros((bh, nx1 - nx0), bool)
-                pr_new[:, x0 - nx0:x1 - nx0] = protect
+                pr_new = protect_wide[y0 - cy0:y1 - cy0, nx0 - cx0:nx1 - cx0].copy()
                 tch_new = np.zeros((bh, nx1 - nx0), np.uint8)
                 tch_new[:, x0 - nx0:x1 - nx0] = touch
                 ti_new = np.zeros((bh, nx1 - nx0), np.uint8)
@@ -900,7 +1057,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 ti_new[:, ex0 - nx0:ex1 - nx0] = 255
                 x0, x1, gm, protect, touch, tpl_ink = nx0, nx1, gm_new, pr_new, tch_new, ti_new
                 box_g = gray[y0:y1, x0:x1]
-                rx0, rx1 = max(0, x0 - ring), min(out.shape[1], x1 + ring)
+                rx0, rx1 = max(0, x0 - 6), min(out.shape[1], x1 + 6)
         # the paper under the word: the local average of the paper pixels
         # around each glyph, so the fill follows the ruler's own shading
         reg = padded[ry0:ry1, rx0:rx1].astype(np.float32)
@@ -909,7 +1066,10 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         gm_reg[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = gm
         inside = np.zeros(reg_g.shape, bool)
         inside[max(0, pad - ry0):max(0, H + pad - ry0), max(0, pad - rx0):max(0, W + pad - rx0)] = True
-        wgt = ((reg_g > fill_gray - 12) & ~gm_reg & inside).astype(np.float32)
+        # clean paper only: not the letters' halo, which would pull the fill
+        # a few levels down into a faint ghost of the word
+        halo = cv2.dilate(gm_reg.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
+        wgt = ((reg_g > fill_gray - 6) & ~halo & inside).astype(np.float32)
         local = None
         for ksz in (15, 31, 61):
             den = cv2.blur(wgt, (ksz, ksz))
@@ -937,8 +1097,10 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             full = np.zeros(out.shape[:2], np.uint8)
             full[y0:y1, x0:x1] = touch
             out = rebuild(out, full, grow=1)
+        touched_words.append(word_touched)
     out = out[pad:-pad, pad:-pad]
-    return out, [(x - pad, y - pad, round(score, 2)) for x, y, sc, score, th, tw, name, part in kept]
+    # each hit: (x, y, score, product_over_word)
+    return out, [(x - pad, y - pad, round(score, 2), bool(t)) for (x, y, sc, score, th, tw, name, part), t in zip(kept, touched_words)]
 
 
 def upscale(img: Image.Image, size: int) -> Image.Image:
@@ -993,7 +1155,8 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
     clean = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
     final = clean if no_upscale else upscale(clean, size)
     info = {"logo_hits": logo_hits, "text_hits": text_hits, "logo_b": logo_b,
-            "overlap": round(overlap, 3), "product_px": product_px}
+            "overlap": round(overlap, 3), "product_px": product_px,
+            "ruler_product": any(len(h) > 3 and h[3] for h in text_hits)}
     return pil, final, info
 
 
@@ -1041,7 +1204,7 @@ def main() -> int:
         rel = p.relative_to(in_dir).with_suffix("." + a.format)
         save_image(final, out_dir / rel, a.format, a.quality)
         lg = ", ".join(f"({x},{y}) {s:.2f}" for x, y, s in logo_hits) or "none"
-        tx = ", ".join(f"({x},{y}) {s:.2f}" for x, y, s in text_hits) or "none"
+        tx = ", ".join(f"({h[0]},{h[1]}) {h[2]:.2f}" for h in text_hits) or "none"
         lb = info["logo_b"]
         lb = f"({lb[0]},{lb[1]}) x{lb[2]:.2f} {lb[3]:.2f}" if lb else "none"
         print(f"{rel}: {pil.size[0]}x{pil.size[1]} -> {final.size[0]}x{final.size[1]} | stamp A: {lg} | stamp B: {lb} | ruler text: {tx} | overlap {info['overlap']}")

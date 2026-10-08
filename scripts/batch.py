@@ -13,6 +13,8 @@ naming anything a human should spot-check:
   stamp_over_product  300+ product pixels sat next to a rebuilt area: look at it
   stamp_near_product  15-299 product pixels next to a rebuilt area
   ruler_text          TraxNYC words removed from a ruler shot (count in column)
+  ruler_text_product  the product lay over a ruler word: a piece of the word may
+                      remain next to it, look at it
   error               the file could not be processed (message in `error`)
 Already-finished outputs are skipped, so the run can be resumed.
 """
@@ -58,8 +60,9 @@ def work(args):
            "ruler_words": 0, "overlap": "", "product_px": "", "flags": "", "error": ""}
     try:
         pre = _PRE.get((src.parent.name, src.name))
-        if pre is not None and _COPY["root"] is not None and not pre[0].get("a") and not pre[0].get("b"):
-            # nothing was removed from this image apart from ruler words: unchanged
+        if pre is not None and _COPY["root"] is not None and not pre[0].get("a") and not pre[0].get("b") \
+                and not pre[0].get("ruler_words"):
+            # nothing was removed from this image: its earlier output is unchanged
             old = _COPY["root"] / src.parent.name / (src.stem + ".jpg")
             if old.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)
@@ -94,6 +97,8 @@ def work(args):
         row["ruler_words"] = len(text_hits)
         if text_hits:
             flags.append("ruler_text")
+        if info.get("ruler_product"):
+            flags.append("ruler_text_product")
         row["flags"] = " ".join(flags)
     except Exception as e:  # noqa: BLE001
         row["flags"] = "error"

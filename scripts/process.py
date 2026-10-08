@@ -381,6 +381,35 @@ def set_inpainter(fn):
     _INPAINTER = fn
 
 
+def rebuild(bgr, mask, grow=2, scale=2, ctx=110):
+    """Rebuild the masked pixels with the model, working on a crop around
+    the mask upsampled `scale` times: at the catalogue's 450-500px frame
+    size the model keeps chain links, stones and ruler ticks far crisper and
+    more regular that way. Falls back to OpenCV's fill without a model."""
+    if not mask.any():
+        return bgr
+    if _INPAINTER is None:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))
+        return cv2.inpaint(bgr, cv2.dilate(mask, k) if grow else mask, 3, cv2.INPAINT_TELEA)
+    if scale == 1:
+        return _INPAINTER(bgr, mask, grow=grow)
+    ys, xs = np.where(mask > 0)
+    H, W = mask.shape
+    y0, y1 = max(0, ys.min() - ctx), min(H, ys.max() + ctx + 1)
+    x0, x1 = max(0, xs.min() - ctx), min(W, xs.max() + ctx + 1)
+    crop, m = bgr[y0:y1, x0:x1], mask[y0:y1, x0:x1]
+    c2 = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
+    m2 = cv2.resize(m, (c2.shape[1], c2.shape[0]), interpolation=cv2.INTER_NEAREST)
+    o2 = _INPAINTER(c2, m2, grow=grow * scale)
+    o = cv2.resize(o2, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_AREA)
+    sel = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 3, 2 * grow + 3))) > 0
+    out = bgr.copy()
+    sub = out[y0:y1, x0:x1]
+    sub[sel] = o[sel]
+    out[y0:y1, x0:x1] = sub
+    return out
+
+
 def _inpaint_core(bgr, mask, radius=3):
     if _INPAINTER is not None and mask.any():
         return _INPAINTER(bgr, mask)
@@ -508,8 +537,8 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
         if product_near(bgr, inp, ring=6) < 15 and product_near(out, inp, ring=6) < 15:
             k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             out[cv2.dilate(inp, k3) > 0] = paper
-        elif use_model and _INPAINTER is not None:
-            out = _INPAINTER(out, inp, grow=2)
+        elif use_model:
+            out = rebuild(out, inp, grow=2)
         else:
             out = cv2.inpaint(out, inp, 3, cv2.INPAINT_TELEA)
         # 4b. a rebuilt patch on background comes out faintly grey: snap it
@@ -567,7 +596,8 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2, logo_tpl_bgr=N
     """Remove the grey stamp.
 
     - On plain background: paper fill of the strokes.
-    - Next to or over a product: the model rebuilds the strokes, grown 2px.
+    - Next to or over a product: the model rebuilds the strokes, grown 2px,
+      on a 2x upsampled crop.
       (An arithmetic undo of this stamp was tried and rejected: its strokes
       are one or two pixels wide, so after JPEG compression the undo leaves
       ghost letters on smooth metal and speckle on pave.)
@@ -590,9 +620,7 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2, logo_tpl_bgr=N
         out = bgr.copy()
         out[cv2.dilate(mask, k2) > 0] = paper
         return out, mask
-    if _INPAINTER is not None:
-        return _INPAINTER(bgr, mask, grow=dilate), mask
-    return cv2.inpaint(bgr, cv2.dilate(mask, k2), 2, cv2.INPAINT_TELEA), mask
+    return rebuild(bgr, mask, grow=dilate), mask
 
 
 RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3, 0.9, 0.8)
@@ -689,7 +717,10 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         region = padded[ry0:ry1, rx0:rx1]
         inner = np.zeros(region.shape[:2], bool)
         inner[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = True
-        ringpx = region[~inner]
+        # only real image pixels count as paper, never the white padding
+        inside = np.zeros(region.shape[:2], bool)
+        inside[max(0, pad - ry0):max(0, H + pad - ry0), max(0, pad - rx0):max(0, W + pad - rx0)] = True
+        ringpx = region[~inner & inside]
         ringpx = ringpx[ringpx.min(axis=1) > 170]
         fill = (np.median(ringpx, axis=0) if len(ringpx) >= 20 else np.array([255, 255, 255])).astype(np.uint8)
         fill_gray = float(0.114 * fill[0] + 0.587 * fill[1] + 0.299 * fill[2])
@@ -744,7 +775,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         reg_g = gray[ry0:ry1, rx0:rx1]
         gm_reg = np.zeros(reg_g.shape, bool)
         gm_reg[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = gm
-        wgt = ((reg_g > fill_gray - 12) & ~gm_reg).astype(np.float32)
+        wgt = ((reg_g > fill_gray - 12) & ~gm_reg & inside).astype(np.float32)
         local = None
         for ksz in (15, 31, 61):
             den = cv2.blur(wgt, (ksz, ksz))
@@ -762,7 +793,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         resid = (reg - local)[py_, px_] if len(py_) else np.zeros((1, 3), np.float32)
         rng = np.random.default_rng(int(x) * 7919 + int(y))
         gy, gx = np.where(gm)
-        pick = resid[rng.integers(0, len(resid), size=len(gy))]
+        pick = np.clip(resid[rng.integers(0, len(resid), size=len(gy))], -5, 5)
         sub_local = local[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0]
         box = out[y0:y1, x0:x1]
         box[gy, gx] = np.clip(sub_local[gy, gx] + pick, 0, 255).astype(np.uint8)
@@ -771,10 +802,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         if touch.any():
             full = np.zeros(out.shape[:2], np.uint8)
             full[y0:y1, x0:x1] = touch
-            if _INPAINTER is not None:
-                out = _INPAINTER(out, full, grow=1)
-            else:
-                out = cv2.inpaint(out, cv2.dilate(full, k5), 3, cv2.INPAINT_TELEA)
+            out = rebuild(out, full, grow=1)
     out = out[pad:-pad, pad:-pad]
     return out, [(x - pad, y - pad, round(score, 2)) for x, y, sc, score, th, tw, name, part in kept]
 

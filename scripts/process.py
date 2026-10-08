@@ -589,6 +589,23 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     # hairlines: only where the stamp's own translucent pixels were (plus 2px)
     out = U.clean_thin_residue(out, footprint.astype(np.uint8) * 255, paper, max_chroma=40)
     out = U.flatten_near_paper(out, footprint.astype(np.uint8) * 255, paper)
+    # a fleck of the flame's tip beyond the template's reach: a small blob
+    # of non-paper near the stamp that touches no product is residue
+    prod_out = is_product(out).astype(np.uint8)
+    n_p, lab_p, st_p, _ = cv2.connectedComponentsWithStats(prod_out, connectivity=8)
+    big = np.zeros(n_p, bool)
+    big[1:] = st_p[1:, 4] >= 40
+    big_near = cv2.dilate(big[lab_p].astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+    fleck = np.zeros(out.shape[:2], bool)
+    for i in range(1, n_p):
+        if big[i]:
+            continue
+        comp = lab_p == i
+        if near_foot[comp].all() and not big_near[comp].any():
+            fleck |= comp
+    if fleck.any():
+        fleck = cv2.dilate(fleck.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
+        out[fleck] = paper
     return out, inp
 
 

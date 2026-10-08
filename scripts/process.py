@@ -480,9 +480,9 @@ def _stamp_b_highlight_template(tpl_bgr, grey=70.0):
     this is an opaque light streak that must be rebuilt, not undone."""
     tg = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
     hull = U.stamp_hull(tg) > 0
-    a = U.alpha_from_template(tg, grey)
-    m = hull & (tg > 200) & (a < 0.3)
-    return m.astype(np.uint8) * 255
+    m = hull & (tg > 238)
+    m = cv2.morphologyEx(m.astype(np.uint8) * 255, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    return m
 
 
 def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=True, tol=22):
@@ -511,12 +511,32 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     hl = U.place(bgr.shape, _stamp_b_highlight_template(tpl_bgr, grey), x, y, scale,
                  interp=cv2.INTER_NEAREST) > 127
     on_product = is_product(out, dark=225)
-    # an opaque light part of the stamp (flame highlight, glow) on a product
-    # survives the undo as a bright patch: brighter than the surrounding
-    # product where the template itself is light
-    g_out = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
-    local = cv2.medianBlur(g_out, 21)
-    bright = footprint & (g_out.astype(int) > local.astype(int) + 12) & (tg_placed > 185) & on_product
+    # the flame's bright core is an opaque white streak that the template
+    # (white on white) cannot show: on a product it survives the undo as a
+    # patch clearly brighter than its surroundings where the template is
+    # light. Only sizeable patches count, so a chain link's own sparkle is
+    # not rebuilt (that cost whole runs of links before).
+    g_out = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # the product's own local brightness (background excluded), so a white
+    # streak on skin or at a band's edge is measured against the product
+    pm = on_product.astype(np.float32)
+    dens = cv2.blur(pm, (31, 31))
+    local = cv2.blur(g_out * pm, (31, 31)) / np.maximum(dens, 1e-3)
+    # the streak can reach beyond the template's visible outline (white on
+    # white), so look a little outside the footprint too, but only inside
+    # the product's silhouette and only in patches joined to the stamp
+    k_near = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * round(12 * scale) + 1,) * 2)
+    near_foot = cv2.dilate(footprint.astype(np.uint8), k_near) > 0
+    silhouette = cv2.morphologyEx(on_product.astype(np.uint8), cv2.MORPH_CLOSE,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))) > 0
+    bright = near_foot & silhouette & (g_out > local + 20) & (dens > 0.3)
+    n_b, lab_b, st_b, _ = cv2.connectedComponentsWithStats(bright.astype(np.uint8), connectivity=8)
+    touch_foot = cv2.dilate(footprint.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
+    keep_b = np.zeros(n_b, bool)
+    for i in range(1, n_b):
+        if st_b[i, 4] >= 30 * scale * scale and (touch_foot & (lab_b == i)).any():
+            keep_b[i] = True
+    bright = keep_b[lab_b]
     extra = ((hl & on_product) | bright).astype(np.uint8) * 255
     extra = cv2.dilate(extra, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     inp = np.maximum(inp, extra)
@@ -545,7 +565,7 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
         k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         out = U.snap_background(out, cv2.dilate(inp, k2), paper, light=230, flat=7.0)
     # hairlines: only where the stamp's own translucent pixels were (plus 2px)
-    out = U.clean_thin_residue(out, footprint.astype(np.uint8) * 255, paper)
+    out = U.clean_thin_residue(out, footprint.astype(np.uint8) * 255, paper, max_chroma=40)
     out = U.flatten_near_paper(out, footprint.astype(np.uint8) * 255, paper)
     return out, inp
 
@@ -677,24 +697,68 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             need = thresh if name == "full" else (part_thresh + 0.08 if name in ("left30", "left20", "right30", "top35") else part_thresh)
             for x, y, score in _top_k(res, 6, th, tw):
                 yy = y + band_top
-                # a partial word is also accepted at a lower score when it sits
-                # on the same baseline, at the same size, as a whole word
-                if score < min(need, 0.45) or not accept(x, yy, th, tw):
+                if score < (0.36 if name == "full" else 0.45):
                     continue
                 # letter tops of a bottom-cut word are thin strokes too, so the
                 # tick test only applies to candidates that show whole letters
                 if name not in ("top", "top35") and _looks_like_ticks(gray[yy:yy + th, x:x + tw]):
                     continue
-                cands.append((x, yy, sc, score, th, tw, name, part, need))
-    full = [c for c in cands if c[6] == "full" and c[3] >= c[8]]
-    hits = []
+                # a partial template normally only counts at the frame edge it
+                # belongs to; off the edge it is kept as a candidate for the
+                # aligned acceptance below
+                cands.append((x, yy, sc, score, th, tw, name, part, need if accept(x, yy, th, tw) else 9.0))
+    def aligned(c, others):
+        x, y, sc, score, th, tw = c[:6]
+        return any(abs(y + th - (oy + oth)) <= 0.2 * th and abs(sc - osc) <= 0.16 for ox, oy, osc, _, oth, *_ in others)
+    SMALL = ("left30", "left20", "right30")
+    # the whole word and the large partials are accepted on their own score;
+    # the small partials (two or three letters) match ruler digits too, so
+    # they only count beside a whole word on the same baseline
+    direct = [c[:8] for c in cands if c[6] not in SMALL and c[3] >= c[8]]
+    full_direct = [c for c in direct if c[6] == "full"]
+    hits = list(direct)
+    # a second word on the same baseline, at the same size, as an accepted
+    # word is accepted at a lower score: a word half hidden by the product, a
+    # word printed in a lighter colour, or a piece cut off by the frame
     for c in cands:
         x, y, sc, score, th, tw, name, part, need = c
-        ok = score >= need
-        if not ok and name != "full":
-            ok = any(abs(y + th - (fy + fth)) <= 0.2 * th and abs(sc - fsc) <= 0.16 for fx, fy, fsc, _, fth, *_ in full)
+        if c[:8] in hits:
+            continue
+        if name in SMALL:
+            ok = need < 9 and score >= 0.5 and aligned(c, full_direct)
+        elif name == "full":
+            ok = score >= 0.36 and aligned(c, direct)
+        else:
+            ok = score >= 0.45 and aligned(c, direct)
         if ok:
             hits.append(c[:8])
+    # a partial word whose other half is inside the frame: look for the whole
+    # word anchored on it, at a low score since the position is pinned
+    extra = []
+    for x, y, sc, score, th, tw, name, part in hits:
+        if name == "full":
+            continue
+        fth, ftw = round(TH * sc), round(TW * sc)
+        if name.startswith("left"):
+            ax = x
+        elif name.startswith("right"):
+            ax = x + tw - ftw
+        else:
+            continue
+        ay = y
+        if ax < pad - 6 or ax + ftw > W + pad + 6:
+            continue
+        ry0, ry1 = max(0, ay - 4), min(gray.shape[0], ay + fth + 4)
+        rx0, rx1 = max(0, ax - 4), min(gray.shape[1], ax + ftw + 4)
+        win = gray[ry0:ry1, rx0:rx1]
+        if win.shape[0] <= fth or win.shape[1] <= ftw:
+            continue
+        t = cv2.resize(text_tpl, (ftw, fth), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC)
+        res = cv2.matchTemplate(win, t, cv2.TM_CCOEFF_NORMED)
+        _, mx, _, loc = cv2.minMaxLoc(res)
+        if mx >= 0.3 and not _looks_like_ticks(win[loc[1]:loc[1] + fth, loc[0]:loc[0] + ftw]):
+            extra.append((rx0 + loc[0], ry0 + loc[1], sc, float(mx), fth, ftw, "full", text_tpl))
+    hits = extra + hits
     if not hits:
         return bgr, []
     # full-word hits win over partials; among partials the one showing more
@@ -741,15 +805,28 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         if h_ > 0 and w_ > 0:
             tpl_ink[oy:oy + h_, ox:ox + w_] = t[:h_, :w_]
         tpl_ink3 = cv2.dilate(tpl_ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-        tpl_ink = cv2.dilate(tpl_ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+        # the template's size steps are coarse, so the far letters of a long
+        # word can sit several pixels off: grow with the word's width
+        g_ = 2 * (5 + int(round(0.03 * tw))) + 1
+        tpl_ink = cv2.dilate(tpl_ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g_, g_)))
         strong = (box_g < fill_gray - 35).astype(np.uint8)
         n, lab, st, _ = cv2.connectedComponentsWithStats(strong, connectivity=8)
         protect = np.zeros(strong.shape, np.uint8)
         touch = np.zeros(strong.shape, np.uint8)
         k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # the letters' own colour, from strokes that stand free of anything
+        # reaching in from above
+        free = (strong > 0) & (tpl_ink3 > 0)
+        for i in range(1, n):
+            if st[i, 1] == 0:
+                free &= lab != i
+        box_bgr = padded[y0:y1, x0:x1]
+        letter_colour = np.median(box_bgr[free], axis=0) if free.sum() >= 30 else None
         for i in range(1, n):
             top, hgt = st[i, 1], st[i, 3]
-            if top != 0:
+            if top != 0 or name.startswith("top"):
+                # (a word cut by the bottom of the frame shows only letter
+                # tops, which touch the box top themselves)
                 continue
             comp = (lab == i).astype(np.uint8) * 255
             if top + hgt < 0.5 * bh:
@@ -762,19 +839,58 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 # model after the paper fill, so the product keeps a clean
                 # edge where the letters touched it
                 body = cv2.bitwise_and(comp, cv2.bitwise_not(tpl_ink3))
+                if letter_colour is not None:
+                    # inside the letter area, pixels that are not letter
+                    # coloured belong to the product
+                    far = np.abs(box_bgr.astype(np.int16) - letter_colour.astype(np.int16)).max(axis=2) > 45
+                    body = np.maximum(body, cv2.bitwise_and(comp, (far.astype(np.uint8) * 255)))
                 protect = np.maximum(protect, body)
                 near_body = cv2.dilate(body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
                 touch = np.maximum(touch, cv2.bitwise_and(cv2.dilate(cv2.bitwise_and(comp, tpl_ink3), k5), near_body))
         protect = cv2.dilate(protect, k5) > 0
         # everything darker than the paper near the letters goes: the ink,
         # its soft edges and the JPEG ringing around it
-        gm = (box_g < fill_gray - 5) & ~protect & (tpl_ink > 0)
+        gm = (box_g < fill_gray - 3) & ~protect & (tpl_ink > 0)
+        if name.startswith("left") or name.startswith("right"):
+            # a partial that is not at the frame edge may show more letters
+            # than its template: fill ink of the same colour as the matched
+            # letters along the rest of the word's extent
+            ftw = round(TW * sc)
+            if name.startswith("left"):
+                ex0, ex1 = x1, min(out.shape[1], x + ftw + margin)
+            else:
+                ex0, ex1 = max(0, x + tw - ftw - margin), x0
+            letter_px = padded[y0:y1, x0:x1][strong > 0]
+            if ex1 > ex0 and len(letter_px) >= 20:
+                lc = np.median(letter_px, axis=0)
+                ext = padded[y0:y1, ex0:ex1].astype(np.int16)
+                ext_g = gray[y0:y1, ex0:ex1]
+                close = (np.abs(ext - lc.astype(np.int16)).max(axis=2) <= 45) & (ext_g < fill_gray - 20)
+                close = cv2.dilate(close.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
+                close &= ext_g < fill_gray - 5
+                # grow the working box to cover the extension
+                nx0, nx1 = min(x0, ex0), max(x1, ex1)
+                gm_new = np.zeros((bh, nx1 - nx0), bool)
+                gm_new[:, x0 - nx0:x1 - nx0] = gm
+                gm_new[:, ex0 - nx0:ex1 - nx0] |= close
+                pr_new = np.zeros((bh, nx1 - nx0), bool)
+                pr_new[:, x0 - nx0:x1 - nx0] = protect
+                tch_new = np.zeros((bh, nx1 - nx0), np.uint8)
+                tch_new[:, x0 - nx0:x1 - nx0] = touch
+                ti_new = np.zeros((bh, nx1 - nx0), np.uint8)
+                ti_new[:, x0 - nx0:x1 - nx0] = tpl_ink
+                ti_new[:, ex0 - nx0:ex1 - nx0] = 255
+                x0, x1, gm, protect, touch, tpl_ink = nx0, nx1, gm_new, pr_new, tch_new, ti_new
+                box_g = gray[y0:y1, x0:x1]
+                rx0, rx1 = max(0, x0 - ring), min(out.shape[1], x1 + ring)
         # the paper under the word: the local average of the paper pixels
         # around each glyph, so the fill follows the ruler's own shading
         reg = padded[ry0:ry1, rx0:rx1].astype(np.float32)
         reg_g = gray[ry0:ry1, rx0:rx1]
         gm_reg = np.zeros(reg_g.shape, bool)
         gm_reg[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = gm
+        inside = np.zeros(reg_g.shape, bool)
+        inside[max(0, pad - ry0):max(0, H + pad - ry0), max(0, pad - rx0):max(0, W + pad - rx0)] = True
         wgt = ((reg_g > fill_gray - 12) & ~gm_reg & inside).astype(np.float32)
         local = None
         for ksz in (15, 31, 61):
@@ -793,7 +909,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         resid = (reg - local)[py_, px_] if len(py_) else np.zeros((1, 3), np.float32)
         rng = np.random.default_rng(int(x) * 7919 + int(y))
         gy, gx = np.where(gm)
-        pick = np.clip(resid[rng.integers(0, len(resid), size=len(gy))], -5, 5)
+        pick = 0.6 * np.clip(resid[rng.integers(0, len(resid), size=len(gy))], -4, 4)
         sub_local = local[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0]
         box = out[y0:y1, x0:x1]
         box[gy, gx] = np.clip(sub_local[gy, gx] + pick, 0, 255).astype(np.uint8)

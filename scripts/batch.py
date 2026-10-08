@@ -18,6 +18,7 @@ Already-finished outputs are skipped, so the run can be resumed.
 """
 import argparse
 import csv
+import shutil
 import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -32,6 +33,8 @@ _TPL = {}
 
 
 _LAMA = {"on": False}
+_PRE = {}
+_COPY = {"root": None}
 
 
 def _templates():
@@ -43,6 +46,8 @@ def _templates():
         _TPL["text"] = load_template(ROOT / "assets/trax_ruler_text_template.png")
         _TPL["logo_b"] = cv2.imread(str(ROOT / "assets/trax_logoB_template.png"), cv2.IMREAD_COLOR)
         _TPL["lettering"] = load_template(ROOT / "assets/trax_logoB_lettering.png")
+        import process as _P
+        _P._LOGO_A_BGR["img"] = cv2.imread(str(ROOT / "assets/trax_logo_template.png"), cv2.IMREAD_COLOR)
     return _TPL["logo"], _TPL["text"], _TPL["logo_b"], _TPL["lettering"]
 
 
@@ -52,8 +57,19 @@ def work(args):
            "stamp_a": "", "stamp_a_score": "", "stamp_b": "", "stamp_b_scale": "", "stamp_b_score": "",
            "ruler_words": 0, "overlap": "", "product_px": "", "flags": "", "error": ""}
     try:
+        pre = _PRE.get((src.parent.name, src.name))
+        if pre is not None and _COPY["root"] is not None and not pre[0].get("a") and not pre[0].get("b"):
+            # nothing was removed from this image apart from ruler words: unchanged
+            old = _COPY["root"] / src.parent.name / (src.stem + ".jpg")
+            if old.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(old, dst)
+                row.update({k: pre[1][k] for k in pre[1] if k in row and k not in ("output",)})
+                row["output"] = str(dst)
+                return row
         logo_tpl, text_tpl, logo_b_tpl, lettering_tpl = _templates()
-        orig, final, info = process_image(src, logo_tpl, text_tpl, 1200, logo_b_tpl=logo_b_tpl, lettering_tpl=lettering_tpl)
+        orig, final, info = process_image(src, logo_tpl, text_tpl, 1200, logo_b_tpl=logo_b_tpl, lettering_tpl=lettering_tpl,
+                                          precomputed=pre[0] if pre is not None else None)
         save_image(final, dst, "jpg")
         row["width"], row["height"] = orig.size
         flags = []
@@ -96,8 +112,24 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=None, help="stop after N files")
     ap.add_argument("--lama", action="store_true", help="use the LaMa model to rebuild what was under a stamp")
     ap.add_argument("--list", default=None, help="CSV with item,file columns: process only these")
+    ap.add_argument("--from-report", default=None, help="earlier report.csv: reuse its stamp/ruler detections")
+    ap.add_argument("--copy-unchanged", default=None, help="earlier output root: copy files that had no stamp instead of re-processing")
     a = ap.parse_args()
     _LAMA["on"] = a.lama
+    _PRE.clear()
+    if a.from_report:
+        for r in csv.DictReader(open(a.from_report)):
+            if r["error"]:
+                continue
+            pre = {"ruler_words": int(r["ruler_words"] or 0)}
+            if r["stamp_a"]:
+                x, y = map(int, r["stamp_a"].split(","))
+                pre["a"] = [(x, y, float(r["stamp_a_score"] or 0))]
+            if r["stamp_b"]:
+                x, y = map(int, r["stamp_b"].split(","))
+                pre["b"] = (x, y, float(r["stamp_b_scale"]), float(r["stamp_b_score"] or 0))
+            _PRE[(r["item"], r["file"])] = (pre, r)
+    _COPY["root"] = Path(a.copy_unchanged) if a.copy_unchanged else None
 
     in_root, out_root = Path(a.input_root), Path(a.output_root)
     report = Path(a.report) if a.report else out_root / "report.csv"

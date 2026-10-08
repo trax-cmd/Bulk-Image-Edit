@@ -46,6 +46,9 @@ def to_rgb(img: Image.Image) -> Image.Image:
     return img.convert("RGB")
 
 
+_LOGO_A_BGR = {}
+
+
 def load_template(path: Path):
     t = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if t is None:
@@ -478,7 +481,7 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     footprint = cv2.dilate(footprint.astype(np.uint8), k) > 0
     hl = U.place(bgr.shape, _stamp_b_highlight_template(tpl_bgr, grey), x, y, scale,
                  interp=cv2.INTER_NEAREST) > 127
-    on_product = out.min(axis=2) < 225
+    on_product = is_product(out, dark=225)
     # an opaque light part of the stamp (flame highlight, glow) on a product
     # survives the undo as a bright patch: brighter than the surrounding
     # product where the template itself is light
@@ -495,12 +498,17 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     expected = np.stack([U.place(bgr.shape, tpl_bgr[..., i].astype(np.float32), x, y, scale, fill=255.0)
                          for i in range(3)], axis=-1)
     like_stamp = (np.abs(bgr.astype(np.int16) - expected.astype(np.int16)) <= tol).all(axis=2) & footprint
-    out[like_stamp & (inp == 0)] = paper
+    undone_light = (out.min(axis=2) >= 215) & ((out.max(axis=2).astype(np.int16) - out.min(axis=2).astype(np.int16)) <= 18)
+    out[like_stamp & undone_light & (inp == 0)] = paper
     # 4a. light flat leftovers in the undone area
     out = U.snap_background(out, trans, paper)
-    # 3. rebuild the opaque parts
+    # 3. rebuild the opaque parts (on plain background a paper fill is exact
+    #    and the model is not needed)
     if inp.any():
-        if use_model and _INPAINTER is not None:
+        if product_near(bgr, inp, ring=6) < 15 and product_near(out, inp, ring=6) < 15:
+            k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            out[cv2.dilate(inp, k3) > 0] = paper
+        elif use_model and _INPAINTER is not None:
             out = _INPAINTER(out, inp, grow=2)
         else:
             out = cv2.inpaint(out, inp, 3, cv2.INPAINT_TELEA)
@@ -513,12 +521,23 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     return out, inp
 
 
+def is_product(bgr, dark=215, texture=10.0):
+    """Pixels that are product rather than plain background: darker than
+    paper in some channel, or locally textured (white metal and stones can be
+    as bright as paper but are never flat)."""
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    mean = cv2.blur(g, (7, 7))
+    sq = cv2.blur(g * g, (7, 7))
+    std = np.sqrt(np.maximum(sq - mean * mean, 0))
+    return (bgr.min(axis=2) < dark) | (std > texture)
+
+
 def product_near(bgr, mask, ring=6, dark=215):
     """Number of product pixels in a ring just outside `mask` (how much of
     the product the removal had to work next to)."""
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring + 1, 2 * ring + 1))
     ringpx = (cv2.dilate(mask, k) > 0) & (mask == 0)
-    return int(((bgr.min(axis=2) < dark) & ringpx).sum())
+    return int((is_product(bgr, dark) & ringpx).sum())
 
 
 def over_product(bgr, mask, inner=3, outer=8, dark=220):
@@ -544,32 +563,36 @@ def find_logo(bgr, logo_tpl, thresh=0.45, stroke_thresh=250, prior_thresh=0.25):
     return match_all(gray, logo_tpl, thresh, mask=stroke, prior=prior, prior_thresh=prior_thresh)
 
 
-def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2):
-    """Remove the grey stamp: the inpainter rebuilds the strokes (grown 2px),
-    which keeps thin features such as clasp tongues and ruler ticks. Without
-    an inpainter, OpenCV's fill is used with a thin mask over tick marks."""
+def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2, logo_tpl_bgr=None):
+    """Remove the grey stamp.
+
+    - On plain background: paper fill of the strokes.
+    - Next to or over a product: the model rebuilds the strokes, grown 2px.
+      (An arithmetic undo of this stamp was tried and rejected: its strokes
+      are one or two pixels wide, so after JPEG compression the undo leaves
+      ghost letters on smooth metal and speckle on pave.)
+    Returns (image, mask of what was rebuilt).
+    """
     if not hits:
         return bgr, None
     th, tw = logo_tpl.shape
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     stroke0 = (logo_tpl < stroke_thresh).astype(np.uint8) * 255
     mask = np.zeros(bgr.shape[:2], np.uint8)
     for x, y, _ in hits:
         h = min(th, mask.shape[0] - y)
         w = min(tw, mask.shape[1] - x)
         mask[y:y + h, x:x + w] = np.maximum(mask[y:y + h, x:x + w], stroke0[:h, :w])
+    k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    near = (cv2.dilate(mask, k2) > 0)
+    prod = is_product(bgr)
+    if int((prod & near & (mask == 0)).sum()) < 15:
+        paper = U.paper_tone(bgr, mask, ring=12)
+        out = bgr.copy()
+        out[cv2.dilate(mask, k2) > 0] = paper
+        return out, mask
     if _INPAINTER is not None:
-        return _INPAINTER(bgr, mask, grow=2), mask
-    on_ticks = False
-    for x, y, _ in hits:
-        h = min(th, mask.shape[0] - y)
-        w = min(tw, mask.shape[1] - x)
-        lower = gray[y + int(h * 0.7):y + h, x:x + w]
-        on_ticks = on_ticks or (lower.size > 0 and float((lower < 150).mean()) >= 0.25)
-    if not on_ticks:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1))
-        mask = cv2.dilate(mask, k)
-    return cv2.inpaint(bgr, mask, 1 if on_ticks else 2, cv2.INPAINT_TELEA), mask
+        return _INPAINTER(bgr, mask, grow=dilate), mask
+    return cv2.inpaint(bgr, cv2.dilate(mask, k2), 2, cv2.INPAINT_TELEA), mask
 
 
 RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3, 0.9, 0.8)
@@ -607,13 +630,15 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
     TH, TW = text_tpl.shape
     parts = [  # (name, template slice, acceptance test on the hit box in padded coords)
         ("full", text_tpl, lambda x, y, h, w: True),
-        ("left", text_tpl[:, : int(TW * 0.45)], lambda x, y, h, w: x + w >= W + pad - 4),
-        ("left30", text_tpl[:, : int(TW * 0.3)], lambda x, y, h, w: x + w >= W + pad - 4),
-        ("right", text_tpl[:, int(TW * 0.55):], lambda x, y, h, w: x <= pad + 4),
+        ("left", text_tpl[:, : int(TW * 0.45)], lambda x, y, h, w: x + w >= W + pad - 6),
+        ("left30", text_tpl[:, : int(TW * 0.3)], lambda x, y, h, w: x + w >= W + pad - 6),
+        ("left20", text_tpl[:, : int(TW * 0.2)], lambda x, y, h, w: x + w >= W + pad - 6),
+        ("right", text_tpl[:, int(TW * 0.55):], lambda x, y, h, w: x <= pad + 6),
+        ("right30", text_tpl[:, int(TW * 0.7):], lambda x, y, h, w: x <= pad + 6),
         ("top", text_tpl[: int(TH * 0.55), :], lambda x, y, h, w: y + h >= H + pad - 4),
         ("top35", text_tpl[: int(TH * 0.35), :], lambda x, y, h, w: y + h >= H + pad - 4),
     ]
-    hits = []
+    cands = []
     for sc in RULER_TEXT_SCALES:
         for name, part, accept in parts:
             th, tw = round(part.shape[0] * sc), round(part.shape[1] * sc)
@@ -621,31 +646,43 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 continue
             t = cv2.resize(part, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC)
             res = cv2.matchTemplate(sub, t, cv2.TM_CCOEFF_NORMED)
-            need = thresh if name == "full" else (part_thresh + 0.08 if name in ("left30", "top35") else part_thresh)
+            need = thresh if name == "full" else (part_thresh + 0.08 if name in ("left30", "left20", "right30", "top35") else part_thresh)
             for x, y, score in _top_k(res, 6, th, tw):
                 yy = y + band_top
-                if score < need or not accept(x, yy, th, tw):
+                # a partial word is also accepted at a lower score when it sits
+                # on the same baseline, at the same size, as a whole word
+                if score < min(need, 0.45) or not accept(x, yy, th, tw):
                     continue
                 # letter tops of a bottom-cut word are thin strokes too, so the
                 # tick test only applies to candidates that show whole letters
                 if name not in ("top", "top35") and _looks_like_ticks(gray[yy:yy + th, x:x + tw]):
                     continue
-                hits.append((x, yy, sc, score, th, tw, name))
+                cands.append((x, yy, sc, score, th, tw, name, part, need))
+    full = [c for c in cands if c[6] == "full" and c[3] >= c[8]]
+    hits = []
+    for c in cands:
+        x, y, sc, score, th, tw, name, part, need = c
+        ok = score >= need
+        if not ok and name != "full":
+            ok = any(abs(y + th - (fy + fth)) <= 0.2 * th and abs(sc - fsc) <= 0.16 for fx, fy, fsc, _, fth, *_ in full)
+        if ok:
+            hits.append(c[:8])
     if not hits:
         return bgr, []
-    hits.sort(key=lambda h: (h[6] != "full", -h[3]))   # full-word hits win over partials
+    # full-word hits win over partials; among partials the one showing more
+    # of the word wins, so a short piece cannot land on the wrong letters
+    hits.sort(key=lambda h: (h[6] != "full", -h[5], -h[3]))
     kept = []
     for h in hits:
-        x, y, sc, score, th, tw, name = h
+        x, y, sc, score, th, tw, name, part = h
         if any(x < k[0] + k[5] and x + tw > k[0] and y < k[1] + k[4] and y + th > k[1] for k in kept):
             continue
         kept.append(h)
     out = padded.copy()
-    for x, y, sc, score, th, tw, name in kept:
-        y0, y1 = max(0, y - margin), y + th + margin
-        x0, x1 = max(0, x - margin), x + tw + margin
-        # fill with the ruler's own paper tone: the median of the non-ink
-        # pixels in a ring just outside the word
+    for x, y, sc, score, th, tw, name, part in kept:
+        y0, y1 = max(0, y - margin), min(out.shape[0], y + th + margin)
+        x0, x1 = max(0, x - margin), min(out.shape[1], x + tw + margin)
+        # the ruler's own paper tone: light pixels in a ring around the word
         ring = 6
         ry0, ry1 = max(0, y0 - ring), min(out.shape[0], y1 + ring)
         rx0, rx1 = max(0, x0 - ring), min(out.shape[1], x1 + ring)
@@ -654,10 +691,92 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         inner[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = True
         ringpx = region[~inner]
         ringpx = ringpx[ringpx.min(axis=1) > 170]
-        fill = np.median(ringpx, axis=0) if len(ringpx) >= 20 else np.array([255, 255, 255])
-        out[y0:y1, x0:x1] = fill.astype(np.uint8)
+        fill = (np.median(ringpx, axis=0) if len(ringpx) >= 20 else np.array([255, 255, 255])).astype(np.uint8)
+        fill_gray = float(0.114 * fill[0] + 0.587 * fill[1] + 0.299 * fill[2])
+        # the glyphs are taken from the image itself (ink darker than the
+        # paper inside the word's box), so a word printed a little larger or
+        # a pixel off from the template is still covered entirely; the
+        # template ink, generously grown, limits that to the word's own
+        # letters, and ink reaching in from above the box (ruler digits,
+        # tick marks) is left alone
+        box_g = gray[y0:y1, x0:x1]
+        bh = y1 - y0
+        # where the template says the letters are (grown 3px, and 5px for the
+        # outer limit of what may be filled)
+        tpl_ink = np.zeros((bh, x1 - x0), np.uint8)
+        t = (cv2.resize(part, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC) < 200).astype(np.uint8) * 255
+        oy, ox = y - y0, x - x0
+        h_, w_ = min(th, tpl_ink.shape[0] - oy), min(tw, tpl_ink.shape[1] - ox)
+        if h_ > 0 and w_ > 0:
+            tpl_ink[oy:oy + h_, ox:ox + w_] = t[:h_, :w_]
+        tpl_ink3 = cv2.dilate(tpl_ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+        tpl_ink = cv2.dilate(tpl_ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+        strong = (box_g < fill_gray - 35).astype(np.uint8)
+        n, lab, st, _ = cv2.connectedComponentsWithStats(strong, connectivity=8)
+        protect = np.zeros(strong.shape, np.uint8)
+        touch = np.zeros(strong.shape, np.uint8)
+        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        for i in range(1, n):
+            top, hgt = st[i, 1], st[i, 3]
+            if top != 0:
+                continue
+            comp = (lab == i).astype(np.uint8) * 255
+            if top + hgt < 0.5 * bh:
+                # a digit's bottom reaching into the box from above
+                protect = np.maximum(protect, comp)
+            else:
+                # something tall reaching in from above: a product lying over
+                # the word. Its pixels away from the letter positions are
+                # kept; the letter strokes attached to it are rebuilt by the
+                # model after the paper fill, so the product keeps a clean
+                # edge where the letters touched it
+                body = cv2.bitwise_and(comp, cv2.bitwise_not(tpl_ink3))
+                protect = np.maximum(protect, body)
+                near_body = cv2.dilate(body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+                touch = np.maximum(touch, cv2.bitwise_and(cv2.dilate(cv2.bitwise_and(comp, tpl_ink3), k5), near_body))
+        protect = cv2.dilate(protect, k5) > 0
+        # everything darker than the paper near the letters goes: the ink,
+        # its soft edges and the JPEG ringing around it
+        gm = (box_g < fill_gray - 5) & ~protect & (tpl_ink > 0)
+        # the paper under the word: the local average of the paper pixels
+        # around each glyph, so the fill follows the ruler's own shading
+        reg = padded[ry0:ry1, rx0:rx1].astype(np.float32)
+        reg_g = gray[ry0:ry1, rx0:rx1]
+        gm_reg = np.zeros(reg_g.shape, bool)
+        gm_reg[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = gm
+        wgt = ((reg_g > fill_gray - 12) & ~gm_reg).astype(np.float32)
+        local = None
+        for ksz in (15, 31, 61):
+            den = cv2.blur(wgt, (ksz, ksz))
+            num = cv2.blur(reg * wgt[..., None], (ksz, ksz))
+            cand = num / np.maximum(den, 1e-6)[..., None]
+            if local is None:
+                local, have = cand, den > 0.05
+            else:
+                local[~have] = cand[~have]
+                have |= den > 0.05
+        local[~have] = fill
+        # the paper's own grain goes on top of the smooth fill, so the filled
+        # letters do not stand out as a flatter, cleaner patch
+        py_, px_ = np.where(wgt > 0)
+        resid = (reg - local)[py_, px_] if len(py_) else np.zeros((1, 3), np.float32)
+        rng = np.random.default_rng(int(x) * 7919 + int(y))
+        gy, gx = np.where(gm)
+        pick = resid[rng.integers(0, len(resid), size=len(gy))]
+        sub_local = local[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0]
+        box = out[y0:y1, x0:x1]
+        box[gy, gx] = np.clip(sub_local[gy, gx] + pick, 0, 255).astype(np.uint8)
+        out[y0:y1, x0:x1] = box
+        touch = cv2.bitwise_and(touch, (tpl_ink > 0).astype(np.uint8) * 255)
+        if touch.any():
+            full = np.zeros(out.shape[:2], np.uint8)
+            full[y0:y1, x0:x1] = touch
+            if _INPAINTER is not None:
+                out = _INPAINTER(out, full, grow=1)
+            else:
+                out = cv2.inpaint(out, cv2.dilate(full, k5), 3, cv2.INPAINT_TELEA)
     out = out[pad:-pad, pad:-pad]
-    return out, [(x - pad, y - pad, round(score, 2)) for x, y, sc, score, th, tw, name in kept]
+    return out, [(x - pad, y - pad, round(score, 2)) for x, y, sc, score, th, tw, name, part in kept]
 
 
 def upscale(img: Image.Image, size: int) -> Image.Image:
@@ -674,7 +793,8 @@ def upscale(img: Image.Image, size: int) -> Image.Image:
     return canvas
 
 
-def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = False, logo_b_tpl=None, lettering_tpl=None):
+def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = False, logo_b_tpl=None, lettering_tpl=None,
+                  precomputed=None):
     """Run the whole pipeline on one file.
 
     Returns (original, final, info) where info has: logo_hits, text_hits,
@@ -684,9 +804,17 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
     """
     pil = to_rgb(ImageOps.exif_transpose(Image.open(path)))
     bgr = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
-    logo_hits = find_logo(bgr, logo_tpl)                     # detect on the untouched image
-    logo_b = find_logo_b(bgr, logo_b_tpl, lettering_tpl) if logo_b_tpl is not None else None
-    bgr, text_hits = remove_ruler_text(bgr, text_tpl)
+    if precomputed is not None:
+        # detections from an earlier run of the same detectors
+        logo_hits = precomputed.get("a") or []
+        logo_b = precomputed.get("b")
+        text_hits = []
+        if precomputed.get("ruler_words", 0) > 0:
+            bgr, text_hits = remove_ruler_text(bgr, text_tpl)
+    else:
+        logo_hits = find_logo(bgr, logo_tpl)                 # detect on the untouched image
+        logo_b = find_logo_b(bgr, logo_b_tpl, lettering_tpl) if logo_b_tpl is not None else None
+        bgr, text_hits = remove_ruler_text(bgr, text_tpl)
     overlap, product_px = 0.0, 0
     if logo_b is not None:
         x, y, sc, _ = logo_b
@@ -696,7 +824,7 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
             overlap = max(overlap, over_product(before, mask_b))
             product_px += product_near(before, mask_b)
     before = bgr
-    bgr, mask_a = remove_logo(bgr, logo_tpl, logo_hits)
+    bgr, mask_a = remove_logo(bgr, logo_tpl, logo_hits, logo_tpl_bgr=_LOGO_A_BGR.get("img"))
     if mask_a is not None:
         overlap = max(overlap, over_product(before, mask_a))
         product_px += product_near(before, mask_a)
@@ -734,6 +862,7 @@ def main() -> int:
         set_inpainter(lama_inpainter())
 
     logo_tpl = load_template(Path(a.logo))
+    _LOGO_A_BGR["img"] = cv2.imread(a.logo, cv2.IMREAD_COLOR)
     text_tpl = load_template(Path(a.ruler_text))
     logo_b_tpl = cv2.imread(a.logo_b, cv2.IMREAD_COLOR)
     lettering_tpl = load_template(Path(a.lettering))

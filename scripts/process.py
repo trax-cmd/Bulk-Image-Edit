@@ -983,7 +983,6 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 # a digit's or tick's foot: kept whole
                 prot_w |= cv2.dilate(comp.astype(np.uint8), k5) > 0
                 continue
-            word_touched = True
             if like_out > 0.5:
                 # the product is of the ink's own colour (or a black digit
                 # over black letters): colour cannot tell them apart. The
@@ -996,6 +995,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 hole = comp & zone & band & (cv2.dilate(glyph_w.astype(np.uint8), k7) > 0) & (gray_w < fill_gray - 1) & ~body
                 prot_w |= comp & ~hole
                 touch_w |= hole
+                word_touched = word_touched or int((comp & zone & band & ~body).sum()) > 40
                 continue
             # a product of another colour over the word: its own-coloured
             # pixels and anything within 3px of them are product, letter-
@@ -1022,6 +1022,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             mend = comp & zone & band & glyph9 & loose & near & ~ink_sure
             touch_w |= mend
             prot_w |= (outside | near) & ~ink_sure & ~mend
+            word_touched = word_touched or int((near & zone & band & glyph9).sum()) > 40
         protect_wide = prot_w
         protect = protect_wide[y0 - cy0:y1 - cy0, x0 - cx0:x1 - cx0]
         touch = (touch_w[y0 - cy0:y1 - cy0, x0 - cx0:x1 - cx0] & ~protect).astype(np.uint8) * 255

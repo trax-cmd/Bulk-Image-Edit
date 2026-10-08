@@ -10,9 +10,8 @@ gets a row in the report CSV with what was detected, plus a `flags` column
 naming anything a human should spot-check:
   no_stamp            neither stamp found (fine if the source had none)
   weak_stamp_a/b      stamp accepted on position only or with a low score
-  stamp_over_product  a good part of the removed stamp's border touched the
-                      product (overlap >= 0.3), so the inpainted patch needs a look
-  stamp_near_product  the stamp brushed the product (overlap 0.1-0.3); usually fine
+  stamp_over_product  300+ product pixels sat next to a rebuilt area: look at it
+  stamp_near_product  15-299 product pixels next to a rebuilt area
   ruler_text          TraxNYC words removed from a ruler shot (count in column)
   error               the file could not be processed (message in `error`)
 Already-finished outputs are skipped, so the run can be resumed.
@@ -51,7 +50,7 @@ def work(args):
     src, dst = args
     row = {"item": src.parent.name, "file": src.name, "output": str(dst), "width": "", "height": "",
            "stamp_a": "", "stamp_a_score": "", "stamp_b": "", "stamp_b_scale": "", "stamp_b_score": "",
-           "ruler_words": 0, "overlap": "", "flags": "", "error": ""}
+           "ruler_words": 0, "overlap": "", "product_px": "", "flags": "", "error": ""}
     try:
         logo_tpl, text_tpl, logo_b_tpl, lettering_tpl = _templates()
         orig, final, info = process_image(src, logo_tpl, text_tpl, 1200, logo_b_tpl=logo_b_tpl, lettering_tpl=lettering_tpl)
@@ -71,9 +70,10 @@ def work(args):
         if not logo_hits and not lb:
             flags.append("no_stamp")
         row["overlap"] = info["overlap"]
-        if info["overlap"] >= 0.3:
+        row["product_px"] = info["product_px"]
+        if info["product_px"] >= 300:
             flags.append("stamp_over_product")
-        elif info["overlap"] >= 0.1:
+        elif info["product_px"] >= 15:
             flags.append("stamp_near_product")
         row["ruler_words"] = len(text_hits)
         if text_hits:
@@ -123,7 +123,7 @@ def main() -> int:
         return 0
 
     fields = ["item", "file", "output", "width", "height", "stamp_a", "stamp_a_score", "stamp_b",
-              "stamp_b_scale", "stamp_b_score", "ruler_words", "overlap", "flags", "error"]
+              "stamp_b_scale", "stamp_b_score", "ruler_words", "overlap", "product_px", "flags", "error"]
     new = not report.exists()
     report.parent.mkdir(parents=True, exist_ok=True)
     done = 0

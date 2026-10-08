@@ -28,6 +28,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+import unblend as U
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from upscale import EXTS, border_color  # noqa: E402
 
@@ -391,40 +393,132 @@ def lama_inpainter(weights=None):
     return Lama(weights)
 
 
-def remove_stamp_b(bgr, tpl_bgr, x, y, scale, light=215):
-    """Remove the coloured stamp with as little collateral damage as possible.
+def _stamp_b_opaque_template(tpl_bgr):
+    """Template-space mask of the coloured stamp's opaque parts: the eye
+    (maroon plus its enclosed white) and the lettering."""
+    tg = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+    tb, tg_, tr = cv2.split(tpl_bgr.astype(int))
+    maroon = ((tr - np.maximum(tg_, tb)) > 40)
+    letters = (tg < 150) & ~maroon
+    eye = cv2.morphologyEx(maroon.astype(np.uint8) * 255, cv2.MORPH_CLOSE,
+                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    eye = cv2.dilate(eye, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    # the lettering carries an opaque white glow about 5px wide
+    let = cv2.dilate(letters.astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+    # the flame's thin spike above the eye has a hard dark edge that an undo
+    # cannot align to the pixel: it is narrow, so it is rebuilt instead
+    ys = np.where(maroon.any(axis=1))[0]
+    eye_top = int(ys.min()) if len(ys) else 0
+    hull = U.stamp_hull(tg)
+    # the needle: the rows above the point where the flame widens
+    widths = (hull > 0).sum(axis=1)
+    wide = np.where(widths >= 25)[0]
+    needle_end = int(wide.min()) + 2 if len(wide) else eye_top + 4
+    tip = np.zeros_like(hull)
+    tip[:needle_end] = hull[:needle_end]
+    # the needle fades out upward; the faint part (template value up to 252)
+    # near the hull belongs to it, and it is extrapolated a little further
+    # along its own axis
+    near_hull = cv2.dilate(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+    faint = ((tg < 253) & near_hull).astype(np.uint8) * 255
+    faint[needle_end:] = 0
+    tip = np.maximum(tip, faint)
+    ys, xs = np.where(tip > 0)
+    if len(ys) > 10:
+        y_top = int(ys.min())
+        band = (ys <= y_top + 12)
+        if band.sum() >= 2 and (ys[band].max() > y_top):
+            # axis from the lowest to the highest rows of the top band
+            lo = ys[band] >= y_top + 6
+            hi = ys[band] <= y_top + 3
+            if lo.any() and hi.any():
+                x_lo, y_lo = xs[band][lo].mean(), ys[band][lo].mean()
+                x_hi, y_hi = xs[band][hi].mean(), ys[band][hi].mean()
+                dx, dy = x_hi - x_lo, y_hi - y_lo
+                n = max(1e-3, (dx * dx + dy * dy) ** 0.5)
+                ex, ey = int(round(x_hi + dx / n * 14)), int(round(y_hi + dy / n * 14))
+                cv2.line(tip, (int(round(x_hi)), int(round(y_hi))), (ex, ey), 255, 3)
+    tip = cv2.dilate(tip, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+    return np.maximum(np.maximum(eye, let), tip)
 
-    Core (eye, lettering, dense shadow) is always inpainted. The faint outer
-    shadow is only flattened on pixels that are themselves background, so a
-    product the stamp touches keeps its detail. Returns (image, core mask).
+
+def _stamp_b_highlight_template(tpl_bgr, grey=70.0):
+    """Template-space mask of the flame's light highlight: inside the stamp's
+    silhouette, light, and low alpha under the grey assumption. On a product
+    this is an opaque light streak that must be rebuilt, not undone."""
+    tg = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+    hull = U.stamp_hull(tg) > 0
+    a = U.alpha_from_template(tg, grey)
+    m = hull & (tg > 200) & (a < 0.3)
+    return m.astype(np.uint8) * 255
+
+
+def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=True, tol=22):
+    """Remove the coloured stamp.
+
+    1. Pixels that look exactly like the stamp on plain white (every channel
+       within `tol` of the template) are background under the stamp: they
+       become the paper tone.
+    2. Translucent parts over a product (flame body, drop shadow) are undone
+       arithmetically, so the product under them is the real product.
+    3. Opaque parts (eye, lettering and its glow, the flame highlight on a
+       product) are rebuilt by the inpainter.
+    4. Light, flat leftovers anywhere in the stamp's footprint are snapped to
+       the paper tone.
+    Returns (image, rebuilt mask).
     """
-    def around(white, dil):
-        cx, cy = x + tpl_bgr.shape[1] * scale / 2, y + tpl_bgr.shape[0] * scale / 2
-        m = np.zeros(bgr.shape[:2], np.uint8)
-        for s2 in (scale * 0.94, scale, scale * 1.06):
-            tw, th = tpl_bgr.shape[1] * s2, tpl_bgr.shape[0] * s2
-            m |= stamp_mask(bgr.shape, tpl_bgr, round(cx - tw / 2), round(cy - th / 2), s2, white_thresh=white, dilate=dil)
-        return m
-    core = around(235, round(2.5 * scale) + 1)
-    full = around(253, round(6 * scale) + 2)
-    halo = (full > 0) & (core == 0)
-    # shadow-tinted product pixels under the translucent parts are rebuilt
-    # too (a model fill reproduces the metal; a paper fill would not)
-    if _INPAINTER is not None:
-        tinted = halo & (bgr.min(axis=2) < light)
-        core = core | (tinted.astype(np.uint8) * 255)
-        halo = (full > 0) & (core == 0)
-    out = _inpaint_core(bgr, core, 3)
-    out = clear_background_ghost(out, core)
-    # background fill colour: light pixels in a ring just outside the full mask
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
-    ringpx = (cv2.dilate(full, k) > 0) & (full == 0)
-    ring_vals = bgr[ringpx]
-    ring_light = ring_vals[ring_vals.min(axis=1) >= light]
-    fill = np.median(ring_light, axis=0).astype(np.uint8) if len(ring_light) else np.array([255, 255, 255], np.uint8)
-    bg_px = halo & (bgr.min(axis=2) >= light)
-    out[bg_px] = fill
-    return out, core
+    opaque_tpl = _stamp_b_opaque_template(tpl_bgr)
+    out, inp, trans = U.unblend(bgr, tpl_bgr, x, y, scale, grey_colour=grey, max_alpha=0.62,
+                                opaque_mask_tpl=opaque_tpl, grow_opaque=0)
+    tg_placed = U.place(bgr.shape, cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32),
+                        x, y, scale, fill=255.0)
+    footprint = U.place(bgr.shape, U.stamp_hull(cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)).astype(np.float32),
+                        x, y, scale, interp=cv2.INTER_NEAREST) > 127
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * round(6 * scale) + 3,) * 2)
+    footprint = cv2.dilate(footprint.astype(np.uint8), k) > 0
+    hl = U.place(bgr.shape, _stamp_b_highlight_template(tpl_bgr, grey), x, y, scale,
+                 interp=cv2.INTER_NEAREST) > 127
+    on_product = out.min(axis=2) < 225
+    # an opaque light part of the stamp (flame highlight, glow) on a product
+    # survives the undo as a bright patch: brighter than the surrounding
+    # product where the template itself is light
+    g_out = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+    local = cv2.medianBlur(g_out, 21)
+    bright = footprint & (g_out.astype(int) > local.astype(int) + 12) & (tg_placed > 185) & on_product
+    extra = ((hl & on_product) | bright).astype(np.uint8) * 255
+    extra = cv2.dilate(extra, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    inp = np.maximum(inp, extra)
+    trans[inp > 0] = 0
+    region = np.maximum(inp, trans)
+    paper = U.paper_tone(bgr, region, ring=12, light=light)
+    # 1. stamp over background: compare the original with the stamp on white
+    expected = np.stack([U.place(bgr.shape, tpl_bgr[..., i].astype(np.float32), x, y, scale, fill=255.0)
+                         for i in range(3)], axis=-1)
+    like_stamp = (np.abs(bgr.astype(np.int16) - expected.astype(np.int16)) <= tol).all(axis=2) & footprint
+    out[like_stamp & (inp == 0)] = paper
+    # 4a. light flat leftovers in the undone area
+    out = U.snap_background(out, trans, paper)
+    # 3. rebuild the opaque parts
+    if inp.any():
+        if use_model and _INPAINTER is not None:
+            out = _INPAINTER(out, inp, grow=2)
+        else:
+            out = cv2.inpaint(out, inp, 3, cv2.INPAINT_TELEA)
+        # 4b. a rebuilt patch on background comes out faintly grey: snap it
+        k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        out = U.snap_background(out, cv2.dilate(inp, k2), paper, light=230, flat=7.0)
+    # hairlines: only where the stamp's own translucent pixels were (plus 2px)
+    out = U.clean_thin_residue(out, footprint.astype(np.uint8) * 255, paper)
+    out = U.flatten_near_paper(out, footprint.astype(np.uint8) * 255, paper)
+    return out, inp
+
+
+def product_near(bgr, mask, ring=6, dark=215):
+    """Number of product pixels in a ring just outside `mask` (how much of
+    the product the removal had to work next to)."""
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring + 1, 2 * ring + 1))
+    ringpx = (cv2.dilate(mask, k) > 0) & (mask == 0)
+    return int(((bgr.min(axis=2) < dark) & ringpx).sum())
 
 
 def over_product(bgr, mask, inner=3, outer=8, dark=220):
@@ -451,32 +545,30 @@ def find_logo(bgr, logo_tpl, thresh=0.45, stroke_thresh=250, prior_thresh=0.25):
 
 
 def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=2):
-    """Inpaint the grey stamp's strokes. Over a row of ruler tick marks the
-    mask is the bare strokes with a 1px inpaint radius, so each tick is
-    rebuilt from its own neighbours instead of smeared into a blotch;
-    elsewhere a wider mask also clears the faint halo."""
+    """Remove the grey stamp: the inpainter rebuilds the strokes (grown 2px),
+    which keeps thin features such as clasp tongues and ruler ticks. Without
+    an inpainter, OpenCV's fill is used with a thin mask over tick marks."""
     if not hits:
         return bgr, None
     th, tw = logo_tpl.shape
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     stroke0 = (logo_tpl < stroke_thresh).astype(np.uint8) * 255
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1))
-    stroke_wide = cv2.dilate(stroke0, k)
     mask = np.zeros(bgr.shape[:2], np.uint8)
+    for x, y, _ in hits:
+        h = min(th, mask.shape[0] - y)
+        w = min(tw, mask.shape[1] - x)
+        mask[y:y + h, x:x + w] = np.maximum(mask[y:y + h, x:x + w], stroke0[:h, :w])
+    if _INPAINTER is not None:
+        return _INPAINTER(bgr, mask, grow=2), mask
     on_ticks = False
     for x, y, _ in hits:
         h = min(th, mask.shape[0] - y)
         w = min(tw, mask.shape[1] - x)
-        under = gray[y:y + h, x:x + w]
-        lower = under[int(h * 0.7):]
-        # a dense dark structure under the lettering (ruler ticks and their
-        # baseline, dark metal) is better served by the thin mask
-        ticks = lower.size > 0 and float((lower < 150).mean()) >= 0.25
-        on_ticks = on_ticks or ticks
-        stroke = stroke0 if ticks else stroke_wide
-        mask[y:y + h, x:x + w] = np.maximum(mask[y:y + h, x:x + w], stroke[:h, :w])
-    if _INPAINTER is not None and not on_ticks:
-        return _INPAINTER(bgr, mask), mask
+        lower = gray[y + int(h * 0.7):y + h, x:x + w]
+        on_ticks = on_ticks or (lower.size > 0 and float((lower < 150).mean()) >= 0.25)
+    if not on_ticks:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1))
+        mask = cv2.dilate(mask, k)
     return cv2.inpaint(bgr, mask, 1 if on_ticks else 2, cv2.INPAINT_TELEA), mask
 
 
@@ -586,26 +678,32 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
     """Run the whole pipeline on one file.
 
     Returns (original, final, info) where info has: logo_hits, text_hits,
-    logo_b (x, y, scale, score) or None, overlap (0..1 fraction of the removed
-    stamp's border that touched non-background pixels).
+    logo_b (x, y, scale, score) or None, overlap (fraction of the rebuilt
+    area's border that touched the product) and product_px (number of
+    product pixels next to anything that was rebuilt).
     """
     pil = to_rgb(ImageOps.exif_transpose(Image.open(path)))
     bgr = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
     logo_hits = find_logo(bgr, logo_tpl)                     # detect on the untouched image
     logo_b = find_logo_b(bgr, logo_b_tpl, lettering_tpl) if logo_b_tpl is not None else None
     bgr, text_hits = remove_ruler_text(bgr, text_tpl)
-    overlap = 0.0
-    bgr, mask_a = remove_logo(bgr, logo_tpl, logo_hits)
-    if mask_a is not None:
-        overlap = max(overlap, over_product(bgr, mask_a))
+    overlap, product_px = 0.0, 0
     if logo_b is not None:
         x, y, sc, _ = logo_b
         before = bgr
-        bgr, core_b = remove_stamp_b(bgr, logo_b_tpl, x, y, sc)
-        overlap = max(overlap, over_product(before, core_b))
+        bgr, mask_b = remove_stamp_b(bgr, logo_b_tpl, x, y, sc)
+        if mask_b is not None and mask_b.any():
+            overlap = max(overlap, over_product(before, mask_b))
+            product_px += product_near(before, mask_b)
+    before = bgr
+    bgr, mask_a = remove_logo(bgr, logo_tpl, logo_hits)
+    if mask_a is not None:
+        overlap = max(overlap, over_product(before, mask_a))
+        product_px += product_near(before, mask_a)
     clean = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
     final = clean if no_upscale else upscale(clean, size)
-    info = {"logo_hits": logo_hits, "text_hits": text_hits, "logo_b": logo_b, "overlap": round(overlap, 3)}
+    info = {"logo_hits": logo_hits, "text_hits": text_hits, "logo_b": logo_b,
+            "overlap": round(overlap, 3), "product_px": product_px}
     return pil, final, info
 
 

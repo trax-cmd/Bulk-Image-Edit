@@ -43,9 +43,10 @@ class Lama:
         out = np.clip(out * 255.0, 0, 255).astype(np.uint8)
         return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
-    def __call__(self, bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        if self.grow:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * self.grow + 1, 2 * self.grow + 1))
+    def __call__(self, bgr: np.ndarray, mask: np.ndarray, grow: int = None) -> np.ndarray:
+        grow = self.grow if grow is None else grow
+        if grow:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))
             mask = cv2.dilate(mask, k)
         ys, xs = np.where(mask > 0)
         if len(ys) == 0:

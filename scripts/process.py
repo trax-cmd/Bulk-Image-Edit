@@ -886,6 +886,17 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
     touched_words = []
     for x, y, sc, score, th, tw, name, part in kept:
         (x0, y0, x1, y1), (rx0, ry0, rx1, ry1), fill, fill_gray = paper_tone(x, y, th, tw)
+        # the paper's own noise level around the word (a grey ruler face
+        # carries a few levels of it, clipped white paper almost none)
+        ring_g = gray[ry0:ry1, rx0:rx1]
+        ring_m = np.ones(ring_g.shape, bool)
+        ring_m[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = False
+        ring_m &= ring_g > fill_gray - 20
+        paper_sigma = float(ring_g[ring_m].std()) if ring_m.sum() >= 20 else 1.0
+        # only ink and its halo are filled, not the darker half of the
+        # paper's own noise: filling that lifted the whole area a couple of
+        # levels and replaced the paper's texture with speckle
+        ink_thr = fill_gray - max(3.0, 1.5 * paper_sigma)
         # the glyphs are taken from the image itself (ink darker than the
         # paper inside the word's box), so a word printed a little larger or
         # a pixel off from the template is still covered entirely; the
@@ -1101,7 +1112,12 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         box_bgr = padded[y0:y1, x0:x1]
         # everything darker than the paper near the letters goes: the ink,
         # its soft edges and the JPEG ringing around it
-        gm = (box_g < fill_gray - 1) & ~protect & (tpl_ink > 0)
+        # the ink, and every pixel within 3px of its core (its soft halo,
+        # whatever the pixel's own level), so the filled band carries the
+        # paper's mean tone rather than the mean of its darker half
+        ink_core = ((box_g < fill_gray - 15) & ~protect & (tpl_ink > 0)).astype(np.uint8)
+        near_ink = cv2.dilate(ink_core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
+        gm = ((box_g < ink_thr) | near_ink) & ~protect & (tpl_ink > 0)
         if name.startswith("left") or name.startswith("right"):
             # a partial that is not at the frame edge may show more letters
             # than its template: fill ink of the same colour as the matched
@@ -1164,7 +1180,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         resid = (reg - local)[py_, px_] if len(py_) else np.zeros((1, 3), np.float32)
         rng = np.random.default_rng(int(x) * 7919 + int(y))
         gy, gx = np.where(gm)
-        pick = 0.8 * np.clip(resid[rng.integers(0, len(resid), size=len(gy))], -6, 6)
+        pick = 0.6 * np.clip(resid[rng.integers(0, len(resid), size=len(gy))], -4, 4)
         sub_local = local[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0]
         box = out[y0:y1, x0:x1]
         box[gy, gx] = np.clip(sub_local[gy, gx] + pick, 0, 255).astype(np.uint8)

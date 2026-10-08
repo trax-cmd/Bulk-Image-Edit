@@ -497,6 +497,9 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
        product) are rebuilt by the inpainter.
     4. Light, flat leftovers anywhere in the stamp's footprint are snapped to
        the paper tone.
+    `grey` is the overlay's assumed grey level: on plain paper the undo is
+    exact whatever it is; on a product it sets how much is taken away
+    (lighter values over-darken polished metal and chain links).
     Returns (image, rebuilt mask).
     """
     opaque_tpl = _stamp_b_opaque_template(tpl_bgr)
@@ -529,12 +532,27 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     near_foot = cv2.dilate(footprint.astype(np.uint8), k_near) > 0
     silhouette = cv2.morphologyEx(on_product.astype(np.uint8), cv2.MORPH_CLOSE,
                                   cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))) > 0
+    # the streak is flat white; a product's own bright, sparkling edge is not
+    mean5 = cv2.blur(g_out, (5, 5))
+    std5 = np.sqrt(np.maximum(cv2.blur(g_out * g_out, (5, 5)) - mean5 * mean5, 0))
     bright = near_foot & silhouette & (g_out > local + 20) & (dens > 0.3)
     n_b, lab_b, st_b, _ = cv2.connectedComponentsWithStats(bright.astype(np.uint8), connectivity=8)
-    touch_foot = cv2.dilate(footprint.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
     keep_b = np.zeros(n_b, bool)
+    k15 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     for i in range(1, n_b):
-        if st_b[i, 4] >= 30 * scale * scale and (touch_foot & (lab_b == i)).any():
+        area, bw, bh = st_b[i, 4], st_b[i, 2], st_b[i, 3]
+        # the streak is a patch of limited size; a huge patch is background
+        # between parts of the product that the silhouette closed over
+        if area < 30 * scale * scale or area > 800 * scale * scale or max(bw, bh) > 70 * scale:
+            continue
+        comp = lab_b == i
+        around = (cv2.dilate(comp.astype(np.uint8), k15) > 0) & ~comp & on_product
+        ref = float(np.median(std5[around])) if around.sum() >= 20 else 4.0
+        d_local = float((g_out[comp] - local[comp]).mean())
+        # on a smooth product (skin, polished metal) any clearly lighter
+        # patch is the streak; on a textured one (chain, pave) only a flat
+        # near-white patch is, never the product's own sparkle
+        if (ref < 12 and d_local >= 25) or (float(g_out[comp].mean()) >= 225 and float(std5[comp].mean()) < 12):
             keep_b[i] = True
     bright = keep_b[lab_b]
     extra = ((hl & on_product) | bright).astype(np.uint8) * 255

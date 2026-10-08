@@ -435,6 +435,10 @@ def _stamp_b_opaque_template(tpl_bgr):
     eye = cv2.morphologyEx(maroon.astype(np.uint8) * 255, cv2.MORPH_CLOSE,
                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
     eye = cv2.dilate(eye, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    # the eye's soft reddish edge: an undo that assumes a grey overlay
+    # leaves a green-blue cast there on a product, so it is rebuilt too
+    reddish = ((tr - np.maximum(tg_, tb)) > 20).astype(np.uint8) * 255
+    eye = np.maximum(eye, cv2.dilate(reddish, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))))
     # the lettering carries an opaque white glow about 5px wide
     let = cv2.dilate(letters.astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
     # the flame's thin spike above the eye has a hard dark edge that an undo
@@ -645,11 +649,19 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1, logo_tpl_bgr=N
         return bgr, None
     th, tw = logo_tpl.shape
     stroke0 = (logo_tpl < stroke_thresh).astype(np.uint8) * 255
+    core0 = (logo_tpl < 200).astype(np.uint8) * 255
     mask = np.zeros(bgr.shape[:2], np.uint8)
+    core = np.zeros(bgr.shape[:2], np.uint8)
     for x, y, _ in hits:
         h = min(th, mask.shape[0] - y)
         w = min(tw, mask.shape[1] - x)
         mask[y:y + h, x:x + w] = np.maximum(mask[y:y + h, x:x + w], stroke0[:h, :w])
+        core[y:y + h, x:x + w] = np.maximum(core[y:y + h, x:x + w], core0[:h, :w])
+    # over dark ink or a dark product the strokes' faint anti-aliased fringe
+    # changes nothing visible, so only the strokes' cores are rebuilt there:
+    # a narrower cut through a ruler digit leaves the model more of its shape
+    dark = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) < 110
+    mask[dark & (core == 0)] = 0
     k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     near = (cv2.dilate(mask, k2) > 0)
     prod = is_product(bgr)
@@ -677,6 +689,9 @@ def _looks_like_ticks(gray_win, dark=200):
     med_h = float(np.median(st[:, 3]) / gray_win.shape[0])
     med_w = float(np.median(st[:, 2]) / gray_win.shape[1])
     return med_h > 0.58 and med_w < 0.07
+
+
+_RULER_DBG = None  # set to a list to collect per-word intermediates (debugging only)
 
 
 def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, margin=4):
@@ -917,11 +932,19 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         zone[zy0:zy1, zx0:zx1] = True
         tpl3_w = np.zeros(blobs.shape, np.uint8)
         tpl3_w[y0 - cy0:y1 - cy0, x0 - cx0:x1 - cx0] = tpl_ink3
+        # the glyphs of the whole word, placed where this (possibly partial)
+        # match puts it, so letters beyond a partial template are known too
+        fth_ = round(TH * sc)
+        t_full = (cv2.resize(text_tpl, (ftw_, fth_), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC) < 200).astype(np.uint8) * 255
+        fx_ = x + tw - ftw_ if name.startswith("right") else x
         glyph_w = np.zeros(blobs.shape, np.uint8)
-        gh, gw = min(th, blobs.shape[0] - (y - cy0)), min(tw, blobs.shape[1] - (x - cx0))
+        gy0, gx0 = y - cy0, fx_ - cx0
+        sy_, sx_ = max(0, -gy0), max(0, -gx0)
+        gh, gw = min(fth_ - sy_, blobs.shape[0] - max(0, gy0)), min(ftw_ - sx_, blobs.shape[1] - max(0, gx0))
         if gh > 0 and gw > 0:
-            glyph_w[y - cy0:y - cy0 + gh, x - cx0:x - cx0 + gw] = t[:gh, :gw]
+            glyph_w[max(0, gy0):max(0, gy0) + gh, max(0, gx0):max(0, gx0) + gw] = t_full[sy_:sy_ + gh, sx_:sx_ + gw]
         glyph_w = cv2.dilate(glyph_w, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
+        gh, gw = min(th, blobs.shape[0] - (y - cy0)), min(tw, blobs.shape[1] - (x - cx0))
         in_frac = np.zeros(n)
         for i in range(1, n):
             comp = lab == i
@@ -967,6 +990,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             letter_like = (resid <= np.maximum(40.0, 0.2 * dn)) & (tt >= -0.15) & (tt <= 2.2)
         else:
             letter_like = np.zeros(blobs.shape, bool)
+        shape_log = []
         for i in range(1, n):
             if in_frac[i] >= 0.9:
                 continue
@@ -979,23 +1003,35 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             # the ink (a pave piece's bright stones lie on every ink line)
             judge = outside & (nonpaper > 0) & (tt > 0.5) if letter_colour is not None else outside
             like_out = float(letter_like[judge].mean()) if judge.sum() >= 30 else 0.0
+            shape_log.append(dict(i=i, px=int(comp.sum()), in_frac=float(in_frac[i]), from_above=bool(from_above),
+                                  depth=float(depth), judge=int(judge.sum()), like_out=like_out))
             if (from_above and depth < 0.5) or letter_colour is None:
                 # a digit's or tick's foot: kept whole
                 prot_w |= cv2.dilate(comp.astype(np.uint8), k5) > 0
                 continue
+            # The part of the shape that continues into the zone from outside
+            # without crossing a letter (the shape's pixels joined to its
+            # outside part through non-glyph pixels) is the product's or the
+            # digit's own body, whatever its colour: letters only lie where
+            # the template puts them. A digit merged with the letters by the
+            # closing is told from them this way; the paper-like pixels the
+            # closing added next to the letters are not part of it
+            flow = (comp & ~glyph_w).astype(np.uint8)
+            _, flab = cv2.connectedComponents(flow, connectivity=8)
+            ids = np.unique(flab[outside & (flow > 0)])
+            reach = np.isin(flab, ids[ids > 0]) & (flow > 0)
+            reach_body = reach & ((nonpaper > 0) | (tpl3_w == 0))
             if like_out > 0.5:
                 # the product is of the ink's own colour (or a black digit
                 # over black letters): colour cannot tell them apart. The
-                # ink on and just around the template's glyph shapes, within
-                # the letters' own rows and away from the shape's body
-                # outside the zone, is rebuilt by the model; the rest is kept
-                band = np.zeros(blobs.shape, bool)
-                band[max(0, y - 2 - cy0):min(blobs.shape[0], y + th + 2 - cy0), :] = True
-                body = cv2.dilate(outside.astype(np.uint8), k7) > 0
-                hole = comp & zone & band & (cv2.dilate(glyph_w.astype(np.uint8), k7) > 0) & (gray_w < fill_gray - 1) & ~body
+                # ink on and just around the template's glyph shapes, away
+                # from the shape's own body, is rebuilt by the model; the
+                # rest is kept
+                body = cv2.dilate((outside | reach_body).astype(np.uint8), k7) > 0
+                hole = comp & zone & (cv2.dilate(glyph_w.astype(np.uint8), k7) > 0) & (gray_w < fill_gray - 1) & ~body
                 prot_w |= comp & ~hole
                 touch_w |= hole
-                word_touched = word_touched or int((comp & zone & band & ~body).sum()) > 40
+                word_touched = word_touched or int((comp & zone & ~body).sum()) > 40
                 continue
             # a product of another colour over the word: its own-coloured
             # pixels and anything within 3px of them are product, letter-
@@ -1007,11 +1043,22 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             nc, clab, cst, _ = cv2.connectedComponentsWithStats(core.astype(np.uint8), connectivity=8)
             keep_c = np.zeros(nc, bool)
             keep_c[1:] = cst[1:, 4] >= 6
+            # ... and only when joined to the product's body: a dark patch on
+            # a glyph with no product next to it is a letter's own dark core
+            # (a lightly printed word's strokes run darker than its ink
+            # estimate in places)
+            at_body = cv2.dilate((outside | reach_body).astype(np.uint8), k5) > 0
+            touching = np.zeros(nc, bool)
+            touching[np.unique(clab[at_body & core])] = True
+            keep_c &= touching
             core = keep_c[clab]
             near = cv2.dilate(core.astype(np.uint8), k7) > 0
             # pixels of the ink's colour at least half as dark as the ink are
-            # letters even right against the product
-            ink_sure = comp & zone & letter_like & (tt > 0.5) & (nonpaper > 0) & ~core
+            # letters even near the product; right against it (within 3px of
+            # its own-coloured pixels) they are left to the model instead,
+            # since on a lightly printed word a product's half-tones pass
+            # for ink
+            ink_sure = comp & zone & letter_like & (tt > 0.5) & (nonpaper > 0) & ~core & ~near & ~reach_body
             # ink right against the product takes on some of its colour in
             # the JPEG: dark pixels roughly on the ink line, on the glyphs,
             # are rebuilt by the model rather than kept
@@ -1019,10 +1066,10 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             band = np.zeros(blobs.shape, bool)
             band[max(0, y - 2 - cy0):min(blobs.shape[0], y + th + 2 - cy0), :] = True
             glyph9 = cv2.dilate(glyph_w.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
-            mend = comp & zone & band & glyph9 & loose & near & ~ink_sure
+            mend = comp & zone & band & glyph9 & loose & near & ~ink_sure & ~reach_body
             touch_w |= mend
-            prot_w |= (outside | near) & ~ink_sure & ~mend
-            word_touched = word_touched or int((near & zone & band & glyph9).sum()) > 40
+            prot_w |= (outside | near | reach_body) & ~ink_sure & ~mend
+            word_touched = word_touched or int(((near | reach_body) & zone & band & glyph9).sum()) > 40
         protect_wide = prot_w
         protect = protect_wide[y0 - cy0:y1 - cy0, x0 - cx0:x1 - cx0]
         touch = (touch_w[y0 - cy0:y1 - cy0, x0 - cx0:x1 - cx0] & ~protect).astype(np.uint8) * 255
@@ -1099,6 +1146,12 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             full[y0:y1, x0:x1] = touch
             out = rebuild(out, full, grow=1)
         touched_words.append(word_touched)
+        if _RULER_DBG is not None:
+            _RULER_DBG.append(dict(name=name, sc=sc, score=score, x=x - pad, y=y - pad, th=th, tw=tw,
+                                   box=(x0 - pad, y0 - pad, x1 - pad, y1 - pad), win=(cx0 - pad, cy0 - pad, cx1 - pad, cy1 - pad),
+                                   zone=zone, lab=lab, in_frac=in_frac, prot=prot_w, touch=touch_w, gm=gm,
+                                   letter_like=letter_like, nonpaper=nonpaper > 0, glyph=glyph_w, shapes=shape_log,
+                                   letter_colour=letter_colour, fill=fill, fill_gray=fill_gray, word_touched=word_touched))
     out = out[pad:-pad, pad:-pad]
     # each hit: (x, y, score, product_over_word)
     return out, [(x - pad, y - pad, round(score, 2), bool(t)) for (x, y, sc, score, th, tw, name, part), t in zip(kept, touched_words)]
@@ -1133,14 +1186,15 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
         # detections from an earlier run of the same detectors
         logo_hits = precomputed.get("a") or []
         logo_b = precomputed.get("b")
-        text_hits = []
-        if precomputed.get("ruler_words", 0) > 0:
-            bgr, text_hits = remove_ruler_text(bgr, text_tpl)
+        ruler_words = precomputed.get("ruler_words", 0) > 0
     else:
         logo_hits = find_logo(bgr, logo_tpl)                 # detect on the untouched image
         logo_b = find_logo_b(bgr, logo_b_tpl, lettering_tpl) if logo_b_tpl is not None else None
-        bgr, text_hits = remove_ruler_text(bgr, text_tpl)
+        ruler_words = True
     overlap, product_px = 0.0, 0
+    # the stamps go first: a stamp lying over a ruler word would otherwise be
+    # taken for a product over the word (its strokes kept, the word under
+    # them rebuilt around them, and the stamp's own removal then left a blob)
     if logo_b is not None:
         x, y, sc, _ = logo_b
         before = bgr
@@ -1153,6 +1207,9 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
     if mask_a is not None:
         overlap = max(overlap, over_product(before, mask_a))
         product_px += product_near(before, mask_a)
+    text_hits = []
+    if ruler_words:
+        bgr, text_hits = remove_ruler_text(bgr, text_tpl)
     clean = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
     final = clean if no_upscale else upscale(clean, size)
     info = {"logo_hits": logo_hits, "text_hits": text_hits, "logo_b": logo_b,

@@ -628,14 +628,23 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     under = (trans > 0) & (inp == 0)
     fp = out[under].astype(np.int16)
     paper_share = float(((fp.min(axis=1) >= light) & (fp.max(axis=1) - fp.min(axis=1) <= 20)).mean()) if len(fp) >= 50 else 1.0
-    no_paper = paper_share < 0.5
+    # ... and around it: with paper around, the sweep below clears what the
+    # undo leaves on it, and a product under the flame keeps its own pixels
+    ring = (cv2.dilate(footprint.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))) > 0) & ~footprint
+    rp = out[ring].astype(np.int16)
+    ring_share = float(((rp.min(axis=1) >= light) & (rp.max(axis=1) - rp.min(axis=1) <= 20)).mean()) if len(rp) >= 50 else 1.0
+    no_paper = paper_share < 0.5 and ring_share < 0.35
     if no_paper and use_model:
         # on skin or a dark backdrop the arithmetic undo of the translucent
         # parts (which assumes paper under them) leaves a pale ghost of the
-        # flame and its shadow: the whole footprint is rebuilt instead
-        inp = np.maximum(inp, footprint.astype(np.uint8) * 255)
-        trans[:] = 0
-        out = bgr.copy()
+        # flame and its shadow: what the undo left that is not paper is
+        # rebuilt instead (the paper it did recover stays, so the model is
+        # not asked to fill white and leave a blob there)
+        paperlike = (out.min(axis=2) >= light) & ((out.max(axis=2).astype(np.int16) - out.min(axis=2).astype(np.int16)) <= 20)
+        extra_np = (under & ~paperlike).astype(np.uint8) * 255
+        extra_np = cv2.dilate(extra_np, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        inp = np.maximum(inp, extra_np)
+        trans[inp > 0] = 0
     # 1. stamp over background: compare the original with the stamp on white
     expected = np.stack([U.place(bgr.shape, tpl_bgr[..., i].astype(np.float32), x, y, scale, fill=255.0)
                          for i in range(3)], axis=-1)
@@ -712,13 +721,18 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
         real[1:] |= (st2[1:, 4] >= 1500) & beyond[1:]
         real[0] = False
         real_near = cv2.dilate(real[lab2].astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
-        dev = (np.abs(out.astype(np.int16) - paper.astype(np.int16)).max(axis=2) > 8).astype(np.uint8)
+        devv = np.abs(out.astype(np.int16) - paper.astype(np.int16)).max(axis=2)
+        dev = (devv > 8).astype(np.uint8)
         # only a patch that lies wholly within the stamp's reach: a pale
         # blurred product continues beyond it and is kept
         nd, dlab, dst_, _ = cv2.connectedComponentsWithStats(dev, connectivity=8)
         inside = np.ones(nd, bool)
         inside[np.unique(dlab[(dev > 0) & ~near_foot])] = False
-        inside[1:] &= dst_[1:, 4] <= 4000       # a broad soft shading is not a leftover
+        # a broad patch is a leftover only when it is clearly off paper
+        # somewhere (the eye's shadow); a broad faint one is soft shading
+        strong = np.zeros(nd, bool)
+        strong[np.unique(dlab[devv >= 25])] = True
+        inside[1:] &= (dst_[1:, 4] <= 4000) | strong[1:]
         inside[0] = False
         left = inside[dlab] & ~real_near
         if left.any():

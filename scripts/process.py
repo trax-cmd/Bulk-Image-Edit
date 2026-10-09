@@ -623,6 +623,17 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     trans[inp > 0] = 0
     region = np.maximum(inp, trans)
     paper = U.paper_tone(bgr, region, ring=12, light=light)
+    # what lies under the stamp: paper (white, neutral) or not (skin, a backdrop)
+    fp = bgr[footprint].astype(np.int16)
+    paper_share = float(((fp.min(axis=1) >= light) & (fp.max(axis=1) - fp.min(axis=1) <= 20)).mean()) if len(fp) else 1.0
+    no_paper = paper_share < 0.3
+    if no_paper and use_model:
+        # on skin or a dark backdrop the arithmetic undo of the translucent
+        # parts (which assumes paper under them) leaves a pale ghost of the
+        # flame and its shadow: the whole footprint is rebuilt instead
+        inp = np.maximum(inp, footprint.astype(np.uint8) * 255)
+        trans[:] = 0
+        out = bgr.copy()
     # 1. stamp over background: compare the original with the stamp on white
     expected = np.stack([U.place(bgr.shape, tpl_bgr[..., i].astype(np.float32), x, y, scale, fill=255.0)
                          for i in range(3)], axis=-1)
@@ -685,7 +696,7 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     # jewellery (which has dark pixels, or is large) is the stamp's
     # leftover: its shadow printed off the template, the model's faintly
     # grey paper or a blob it grew from the eye's glow, an undone edge
-    if True:
+    if int(paper.min()) >= 235:
         dark_any = out.min(axis=2) < 150
         prod2 = is_product(out).astype(np.uint8)
         n2, lab2, st2, _ = cv2.connectedComponentsWithStats(prod2, connectivity=8)
@@ -702,9 +713,10 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
         dev = (np.abs(out.astype(np.int16) - paper.astype(np.int16)).max(axis=2) > 8).astype(np.uint8)
         # only a patch that lies wholly within the stamp's reach: a pale
         # blurred product continues beyond it and is kept
-        nd, dlab = cv2.connectedComponents(dev, connectivity=8)
+        nd, dlab, dst_, _ = cv2.connectedComponentsWithStats(dev, connectivity=8)
         inside = np.ones(nd, bool)
         inside[np.unique(dlab[(dev > 0) & ~near_foot])] = False
+        inside[1:] &= dst_[1:, 4] <= 4000       # a broad soft shading is not a leftover
         inside[0] = False
         left = inside[dlab] & ~real_near
         if left.any():
@@ -789,6 +801,10 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1, logo_tpl_bgr=N
             tone = float(np.median(light))
             if tone >= 235:
                 tone = 255.0
+        elif len(box) >= 50:
+            # a dark backdrop: the stamp lightens it, nothing under it is ink
+            tone = float(np.median(box))
+            light = box
         tplg[y:y + h, x:x + w] = np.minimum(tplg[y:y + h, x:x + w], logo_tpl[:h, :w].astype(np.float32) * (tone / 255.0))
         if tone < 235:
             # the stamp's white glow around its strokes is invisible on white
@@ -796,8 +812,8 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1, logo_tpl_bgr=N
             # face: pixels next to the strokes lighter than the face go too
             face = light[np.abs(light - tone) <= 16]
             sig = float(np.clip(face.std() if len(face) >= 20 else 20.0, 1.0, 20.0))
-            near = cv2.dilate(stroke0[:h, :w], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))) > 0
-            glow = near & (gray0[y:y + h, x:x + w] > tone + max(5.0, 2.5 * sig))
+            near = cv2.dilate(stroke0[:h, :w], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+            glow = near & (gray0[y:y + h, x:x + w] > tone + max(5.0, 1.5 * sig))
             mask[y:y + h, x:x + w][glow] = 255
     # a pixel clearly darker than the stamp's own stroke would be on the
     # face at that spot is ink or product showing through the translucent
@@ -852,6 +868,8 @@ def settle_face(out, src, mask, kept, grow=4, tol_k=3.0, tol_min=8, share=0.6, d
         return out
     tone = np.median(src[facepx].astype(np.float32), axis=0)
     sigma = float(np.clip(gsrc[facepx].std(), 1.0, 20.0))
+    if sigma > 6.0:
+        return out                      # skin or a textured surface: its grain is not a ghost
     tol = max(tol_min, tol_k * sigma)
     region = (cv2.dilate(m, k(grow)) > 0) & (cv2.dilate(kept.astype(np.uint8), k(3)) == 0)
     dev = out.astype(np.float32) - tone
@@ -1564,6 +1582,8 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
         th_a, tw_a = logo_tpl.shape
         def over_stamp(h):
             x, y, th, tw = h[0] - 120, h[1] - 120, h[4], h[5]
+            if h[2] >= 0.7:
+                return False                  # a ruler word under the stamp is larger
             for ax, ay, _ in logo_hits:
                 ix = max(0, min(x + tw, ax + tw_a) - max(x, ax)); iy = max(0, min(y + th, ay + th_a) - max(y, ay))
                 if ix * iy >= 0.3 * th * tw:

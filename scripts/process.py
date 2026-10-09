@@ -576,7 +576,7 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     # 3. rebuild the opaque parts (on plain background a paper fill is exact
     #    and the model is not needed)
     if inp.any():
-        if product_near(bgr, inp, ring=6) < 15 and product_near(out, inp, ring=6) < 15:
+        if plain_background(out, inp):
             k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             out[cv2.dilate(inp, k3) > 0] = paper
         elif use_model:
@@ -593,8 +593,16 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     # of non-paper near the stamp that touches no product is residue
     prod_out = is_product(out).astype(np.uint8)
     n_p, lab_p, st_p, _ = cv2.connectedComponentsWithStats(prod_out, connectivity=8)
+    # (a light blob of some size with no dark pixel at all is the stamp's
+    # shadow printed off the template, never a piece of jewellery, which
+    # always carries dark edges or facets)
+    g_res = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
     big = np.zeros(n_p, bool)
     big[1:] = st_p[1:, 4] >= 40
+    light = np.ones(n_p, bool)
+    for i in range(1, n_p):
+        if big[i] and st_p[i, 4] <= 600 and int(g_res[lab_p == i].min()) > 150:
+            big[i] = False
     big_near = cv2.dilate(big[lab_p].astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
     fleck = np.zeros(out.shape[:2], bool)
     for i in range(1, n_p):
@@ -680,14 +688,35 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1, logo_tpl_bgr=N
     dark = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) < 110
     mask[dark & (core == 0)] = 0
     k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    near = (cv2.dilate(mask, k2) > 0)
-    prod = is_product(bgr)
-    if int((prod & near & (mask == 0)).sum()) < 15:
+    if plain_background(bgr, mask, dark=110):
+        # on plain background the paper fill is exact; the model's paper
+        # comes out faintly grey. Light flat leftovers of the strokes' edges
+        # (a stamp printed a pixel off the template) are snapped to paper
         paper = U.paper_tone(bgr, mask, ring=12)
         out = bgr.copy()
         out[cv2.dilate(mask, k2) > 0] = paper
+        k4 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        out = U.snap_background(out, cv2.dilate(mask, k4), paper, light=225, flat=8.0)
         return out, mask
     return rebuild(bgr, mask, grow=dilate), mask
+
+
+def plain_background(bgr, mask, dark=215, ring=6, far=(4, 10), dev=15, max_dark=15, max_dev=30):
+    """True when nothing but plain background lies next to `mask`: fewer
+    than `max_dark` pixels darker than `dark` within `ring` px of it, and
+    fewer than `max_dev` pixels in a farther ring (`far` px out, beyond the
+    stamp's own anti-aliased edge) that differ from the paper tone by more
+    than `dev` levels (a pale, blurred product is neither dark nor
+    textured, but it is not paper either)."""
+    m = (mask > 0).astype(np.uint8)
+    k = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    ring1 = (cv2.dilate(m, k(ring)) > 0) & (m == 0)
+    if int(((bgr.min(axis=2) < dark) & ring1).sum()) >= max_dark:
+        return False
+    ring2 = (cv2.dilate(m, k(far[1])) > 0) & (cv2.dilate(m, k(far[0])) == 0)
+    paper = U.paper_tone(bgr, mask, ring=12).astype(np.int16)
+    d = np.abs(bgr.astype(np.int16) - paper).max(axis=2)
+    return int(((d > dev) & ring2).sum()) < max_dev
 
 
 RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3, 0.9, 0.8)

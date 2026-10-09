@@ -230,7 +230,7 @@ def _find_logo_b_masked(bgr, tpl_bgr, thresh=0.45, big_thresh=0.6, color_thresh=
 
 
 LETTERING_OFFSET = (100, 114)     # top-left of the lettering band inside the stamp template
-LETTERING_SCALES = (1.0, 1.1, 1.2, 1.3, 0.9, 1.4, 1.5, 1.6, 1.7)
+LETTERING_SCALES = (1.0, 1.1, 1.2, 1.3, 0.9, 1.4, 1.5, 1.6, 1.7, 1.9, 2.1, 2.3)   # up to 2.3 on the portrait frames
 
 
 def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.5, big_thresh=0.85, color_thresh=0.5, topk=3):
@@ -250,7 +250,7 @@ def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.5, big_thresh=0.85, color_
     tb, tg_, tr = cv2.split(tpl_bgr.astype(int))
     red_mask = ((tr - np.maximum(tg_, tb)) > 40).astype(np.uint8)
     pad = int(lettering_tpl.shape[1] * 1.2)
-    y_off = max(0, int(H * 0.35) - pad)
+    y_off = 0                      # the stamp sits at the top of some frames
     gray = cv2.copyMakeBorder(gray_full[y_off:], 0, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
     padded = cv2.copyMakeBorder(bgr[y_off:], 0, pad, pad, pad, cv2.BORDER_CONSTANT, value=(255, 255, 255))
     ox, oy = LETTERING_OFFSET
@@ -276,7 +276,10 @@ def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.5, big_thresh=0.85, color_
             if score < thresh:
                 continue
             sx, sy = stamp_origin(lx, ly, sc)
-            if _maroon_fraction(padded, red_mask, sx, sy, sc) < color_thresh:
+            # on a grey frame the translucent eye prints as a muted pink, so
+            # a strong lettering match needs less of it
+            need = color_thresh if score < 0.6 else min(color_thresh, 0.3)
+            if _maroon_fraction(padded, red_mask, sx, sy, sc) < need:
                 continue
             if best is None or score > best[3]:
                 best = (lx, ly, sc, score)
@@ -908,6 +911,30 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
     # a small word (under 0.8 of the template) counts only at a good score
     # and beside another small word of the same size on the same baseline:
     # at that size a lone match is as likely a scrap of product or shadow
+    def looks_like_word(c):
+        # the printed word has tall letters (T, N, Y, C) and short ones
+        # (r, a, x) side by side; a row of stones, a chain, a "mm" label or
+        # blank paper does not
+        x, y, sc, score, th, tw = c[:6]
+        win = gray[y:y + th, x:x + tw].astype(np.int16)
+        if win.size == 0:
+            return False
+        fill = float(np.median(win))
+        ink = (win < fill - 40).astype(np.uint8)
+        n, _, st, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+        st = st[1:]
+        st = st[st[:, 4] >= 2]
+        hs = st[:, 3] / float(th)
+        st, hs = st[hs >= 0.15], hs[hs >= 0.15]      # specks are not letters
+        if not (3 <= len(st) <= 14):
+            return False
+        hmax = float(hs.max())
+        if hmax < 0.35:
+            return False
+        tall = int((hs >= 0.75 * hmax).sum())
+        short = int(((hs >= 0.45 * hmax) & (hs < 0.75 * hmax)).sum())
+        span = (st[:, 0] + st[:, 2]).max() - st[:, 0].min()
+        return tall >= 2 and short >= 1 and span >= 0.6 * tw
     def has_ink(c):
         # a small template's correlation spikes on blank paper and on
         # product texture: the window must hold ink in a word's proportion
@@ -920,7 +947,8 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         return 0.05 <= frac <= 0.5
     def small_ok(c):
         return c[3] >= 0.5 and has_ink(c)
-    direct = [c[:8] for c in cands if c[6] not in SMALL and c[3] >= c[8] and (c[2] >= 0.8 or small_ok(c))]
+    direct = [c[:8] for c in cands if c[6] not in SMALL and c[3] >= c[8] and (c[2] >= 0.8 or small_ok(c))
+              and (c[6] != "full" or c[3] >= 0.55 or looks_like_word(c))]
     full_direct = [c for c in direct if c[6] == "full"]
     hits = list(direct)
     # a second word on the same baseline, at the same size, as an accepted
@@ -933,7 +961,8 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         if name in SMALL:
             ok = need < 9 and score >= 0.5 and aligned(c, full_direct)
         elif name == "full":
-            ok = score >= (thresh if sc < 0.8 else 0.36) and aligned(c, direct) and (sc >= 0.8 or has_ink(c))
+            ok = score >= (thresh if sc < 0.8 else 0.36) and aligned(c, direct) and (sc >= 0.8 or has_ink(c)) \
+                and (score >= 0.55 or looks_like_word(c))
         else:
             ok = score >= 0.45 and aligned(c, direct)
         if ok:

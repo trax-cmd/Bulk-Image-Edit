@@ -232,7 +232,7 @@ LETTERING_OFFSET = (100, 114)     # top-left of the lettering band inside the st
 LETTERING_SCALES = (1.0, 1.1, 1.2, 1.3, 0.9, 1.4, 1.5, 1.6, 1.7)
 
 
-def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.68, big_thresh=0.85, color_thresh=0.5, topk=3):
+def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.5, big_thresh=0.85, color_thresh=0.5, topk=3):
     """Locate the large coloured TraxNYC stamp via its 'TraxNYC' lettering.
 
     The lettering is opaque and carries its own white halo, so it looks the
@@ -599,10 +599,15 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     g_res = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
     big = np.zeros(n_p, bool)
     big[1:] = st_p[1:, 4] >= 40
-    light = np.ones(n_p, bool)
+    tb_, tg__, tr_ = cv2.split(out.astype(np.int16))
+    maroon_px = ((tr_ - np.maximum(tg__, tb_)) > 40) & (tg__ < 100)   # dark red, not gold
     for i in range(1, n_p):
-        if big[i] and st_p[i, 4] <= 600 and int(g_res[lab_p == i].min()) > 150:
-            big[i] = False
+        if big[i] and st_p[i, 4] <= 600:
+            comp_i = lab_p == i
+            # a light blob, or a maroon one (a piece of the eye printed off
+            # the template), is never jewellery
+            if int(g_res[comp_i].min()) > 150 or float(maroon_px[comp_i].mean()) > 0.5:
+                big[i] = False
     big_near = cv2.dilate(big[lab_p].astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
     fleck = np.zeros(out.shape[:2], bool)
     for i in range(1, n_p):
@@ -614,6 +619,30 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     if fleck.any():
         fleck = cv2.dilate(fleck.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
         out[fleck] = paper
+    # everything near the stamp that is not paper and is not joined to real
+    # jewellery (which has dark pixels, or is large) is the stamp's
+    # leftover: its shadow printed off the template, the model's faintly
+    # grey paper or a blob it grew from the eye's glow, an undone edge
+    if True:
+        dark_any = out.min(axis=2) < 150
+        prod2 = is_product(out).astype(np.uint8)
+        n2, lab2, st2, _ = cv2.connectedComponentsWithStats(prod2, connectivity=8)
+        real = np.zeros(n2, bool)
+        real[np.unique(lab2[dark_any & (prod2 > 0)])] = True
+        real[1:] |= st2[1:, 4] >= 1500      # a large pale thing (a blurred shank) is real too
+        real[0] = False
+        real_near = cv2.dilate(real[lab2].astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+        dev = (np.abs(out.astype(np.int16) - paper.astype(np.int16)).max(axis=2) > 8).astype(np.uint8)
+        # only a patch that lies wholly within the stamp's reach: a pale
+        # blurred product continues beyond it and is kept
+        nd, dlab = cv2.connectedComponents(dev, connectivity=8)
+        inside = np.ones(nd, bool)
+        inside[np.unique(dlab[(dev > 0) & ~near_foot])] = False
+        inside[0] = False
+        left = inside[dlab] & ~real_near
+        if left.any():
+            left = cv2.dilate(left.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
+            out[left & ~real_near] = paper
     return out, inp
 
 
@@ -918,6 +947,10 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         core = cv2.dilate(t[:gh, :gw], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         ng, glab = cv2.connectedComponents(core, connectivity=8)
         strong = g_win < fill_gray - max(35.0, 4 * sigma)
+        if int((strong & (core > 0)).sum()) < 8:
+            # a word printed in a pale ink (light cyan on white): take the
+            # darkest of what there is
+            strong = g_win < fill_gray - max(8.0, 2 * sigma)
         cols = []
         for gi in range(1, ng):
             m = (glab == gi) & strong
@@ -1030,6 +1063,8 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         glyph_core = cv2.dilate(glyph_core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         ng, glab = cv2.connectedComponents(glyph_core, connectivity=8)
         strong_w = gray_w < fill_gray - off_strong
+        if int((strong_w & (glyph_core > 0)).sum()) < 8:
+            strong_w = gray_w < fill_gray - max(8.0, 2 * paper_sigma)
         per_letter = []
         for gi in range(1, ng):
             gm_ = (glab == gi) & strong_w

@@ -858,12 +858,26 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         inside = np.zeros(region.shape[:2], bool)
         inside[max(0, pad - ry0):max(0, H + pad - ry0), max(0, pad - rx0):max(0, W + pad - rx0)] = True
         ringpx = region[~inner & inside]
-        ringpx = ringpx[ringpx.min(axis=1) > 170]
-        fill = (np.median(ringpx, axis=0) if len(ringpx) >= 20 else np.array([255, 255, 255])).astype(np.uint8)
+        # the paper is the ring's lighter majority (a ruler face may be grey
+        # or tinted, so no fixed brightness is assumed); its noise level
+        # scales the ink thresholds below
+        if len(ringpx) >= 20:
+            rg = 0.114 * ringpx[:, 0] + 0.587 * ringpx[:, 1] + 0.299 * ringpx[:, 2]
+            # the paper's level is the ring's most common one (its mode), so
+            # the ticks, digits and letters in the ring do not pull it down
+            # and the face's own darker grain does not pull it up
+            hist, edges = np.histogram(rg, bins=np.arange(0, 260, 4))
+            mode = float(edges[int(np.argmax(hist))] + 2)
+            light = ringpx[np.abs(rg - mode) <= 12]
+            fill = np.median(light, axis=0).astype(np.uint8)
+            wide = rg[np.abs(rg - mode) <= 24]
+            sigma = float(min(20.0, max(1.0, wide.std())))
+        else:
+            fill, sigma = np.array([255, 255, 255], np.uint8), 1.0
         fill_gray = float(0.114 * fill[0] + 0.587 * fill[1] + 0.299 * fill[2])
-        return (x0, y0, x1, y1), (rx0, ry0, rx1, ry1), fill, fill_gray
+        return (x0, y0, x1, y1), (rx0, ry0, rx1, ry1), fill, fill_gray, sigma
 
-    def ink_per_letter(x, y, th, tw, part, sc, fill_gray):
+    def ink_per_letter(x, y, th, tw, part, sc, fill_gray, sigma=1.0):
         """The median colour of the darker third of each of the word's
         letters, as placed by the template (one entry per letter found)."""
         t = (cv2.resize(part, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC) < 200).astype(np.uint8) * 255
@@ -874,7 +888,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         b_win = padded[y:y + gh, x:x + gw]
         core = cv2.dilate(t[:gh, :gw], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         ng, glab = cv2.connectedComponents(core, connectivity=8)
-        strong = g_win < fill_gray - 35
+        strong = g_win < fill_gray - max(35.0, 4 * sigma)
         cols = []
         for gi in range(1, ng):
             m = (glab == gi) & strong
@@ -889,8 +903,8 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
     # over some letters of a word spoils that word's estimate)
     ink_global, best = None, (-1, -1)
     for x, y, sc, score, th, tw, name, part in kept:
-        _, _, fill_, fg_ = paper_tone(x, y, th, tw)
-        cols = ink_per_letter(x, y, th, tw, part, sc, fg_)
+        _, _, fill_, fg_, sg_ = paper_tone(x, y, th, tw)
+        cols = ink_per_letter(x, y, th, tw, part, sc, fg_, sg_)
         if len(cols) < 2:
             continue
         arr = np.array(cols)
@@ -902,14 +916,14 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
 
     touched_words = []
     for x, y, sc, score, th, tw, name, part in kept:
-        (x0, y0, x1, y1), (rx0, ry0, rx1, ry1), fill, fill_gray = paper_tone(x, y, th, tw)
-        # the paper's own noise level around the word (a grey ruler face
-        # carries a few levels of it, clipped white paper almost none)
-        ring_g = gray[ry0:ry1, rx0:rx1]
-        ring_m = np.ones(ring_g.shape, bool)
-        ring_m[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = False
-        ring_m &= ring_g > fill_gray - 20
-        paper_sigma = float(ring_g[ring_m].std()) if ring_m.sum() >= 20 else 1.0
+        (x0, y0, x1, y1), (rx0, ry0, rx1, ry1), fill, fill_gray, paper_sigma = paper_tone(x, y, th, tw)
+        # offsets below the paper tone that mean ink, scaled by the paper's
+        # own noise (a grey ruler face carries ten levels of it, clipped
+        # white paper almost none)
+        off_np = max(12.0, 2.5 * paper_sigma)      # anything that is not paper
+        off_core = max(15.0, 3.0 * paper_sigma)    # the ink's core
+        off_dark = max(30.0, 4.0 * paper_sigma)    # clearly dark
+        off_strong = max(35.0, 4.0 * paper_sigma)
         # only ink and its halo are filled, not the darker half of the
         # paper's own noise: filling that lifted the whole area a couple of
         # levels and replaced the paper's texture with speckle
@@ -935,7 +949,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         # word can sit several pixels off: grow with the word's width
         g_ = 2 * (5 + int(round(0.03 * tw))) + 1
         tpl_ink = cv2.dilate(tpl_ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g_, g_)))
-        strong = (box_g < fill_gray - 35).astype(np.uint8)
+        strong = (box_g < fill_gray - off_strong).astype(np.uint8)
         # Everything that is not paper, in a window around the word, grouped
         # into shapes. A shape that lives inside the word's zone is letters;
         # a shape that reaches beyond it is a ruler digit or tick coming in
@@ -946,7 +960,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         cx0, cx1 = max(0, x0 - ftw_ - 24), min(gray.shape[1], x1 + ftw_ + 24)
         gray_w = gray[cy0:cy1, cx0:cx1]
         bgr_w = padded[cy0:cy1, cx0:cx1].astype(np.int16)
-        nonpaper = (gray_w < fill_gray - 12).astype(np.uint8)
+        nonpaper = (gray_w < fill_gray - off_np).astype(np.uint8)
         blobs = cv2.morphologyEx(nonpaper, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
         n, lab, st, _ = cv2.connectedComponentsWithStats(blobs, connectivity=8)
         zone = np.zeros(blobs.shape, bool)
@@ -986,7 +1000,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             glyph_core[y - cy0:y - cy0 + gh, x - cx0:x - cx0 + gw] = t[:gh, :gw]
         glyph_core = cv2.dilate(glyph_core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         ng, glab = cv2.connectedComponents(glyph_core, connectivity=8)
-        strong_w = gray_w < fill_gray - 35
+        strong_w = gray_w < fill_gray - off_strong
         per_letter = []
         for gi in range(1, ng):
             gm_ = (glab == gi) & strong_w
@@ -1053,7 +1067,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             # ... and only through clearly dark pixels: a ruler's paper shades
             # by more than the non-paper margin across a window, and that
             # shading must not carry the flow from a tick to a letter
-            dark_w = (gray_w < fill_gray - 30).astype(np.uint8)
+            dark_w = (gray_w < fill_gray - off_dark).astype(np.uint8)
             tight = cv2.morphologyEx(dark_w, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
             flow = (comp & tight & ~glyph_w).astype(np.uint8)
             _, flab = cv2.connectedComponents(flow, connectivity=8)
@@ -1132,7 +1146,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         # the ink, and every pixel within 3px of its core (its soft halo,
         # whatever the pixel's own level), so the filled band carries the
         # paper's mean tone rather than the mean of its darker half
-        ink_core = ((box_g < fill_gray - 15) & ~protect & (tpl_ink > 0)).astype(np.uint8)
+        ink_core = ((box_g < fill_gray - off_core) & ~protect & (tpl_ink > 0)).astype(np.uint8)
         near_ink = cv2.dilate(ink_core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
         gm = ((box_g < ink_thr) | near_ink) & ~protect & (tpl_ink > 0)
         if name.startswith("left") or name.startswith("right"):
@@ -1146,9 +1160,9 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 ex0, ex1 = max(0, x + tw - ftw - margin), x0
             if ex1 > ex0 and letter_colour is not None:
                 ext_g = gray[y0:y1, ex0:ex1]
-                close = letter_like[y0 - cy0:y1 - cy0, ex0 - cx0:ex1 - cx0] & (ext_g < fill_gray - 20)
+                close = letter_like[y0 - cy0:y1 - cy0, ex0 - cx0:ex1 - cx0] & (ext_g < fill_gray - max(20.0, 3.0 * paper_sigma))
                 close = cv2.dilate(close.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
-                close &= ext_g < fill_gray - 5
+                close &= ext_g < fill_gray - max(5.0, paper_sigma)
                 close &= ~protect_wide[y0 - cy0:y1 - cy0, ex0 - cx0:ex1 - cx0]
                 # grow the working box to cover the extension
                 nx0, nx1 = min(x0, ex0), max(x1, ex1)
@@ -1179,7 +1193,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         # (the paper's own darker grain counts, or the fill comes out a
         # shade lighter than the paper around it and the word shows as a
         # faint light ghost)
-        wgt = ((reg_g > fill_gray - 15) & ~halo & inside).astype(np.float32)
+        wgt = ((reg_g > fill_gray - off_core) & ~halo & inside).astype(np.float32)
         local = None
         for ksz in (15, 31, 61):
             den = cv2.blur(wgt, (ksz, ksz))

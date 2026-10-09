@@ -50,7 +50,7 @@ def main() -> int:
             new = Image.open(r["new_output"]).convert("RGB")
             x0, y0, x1, y1 = map(int, r["bbox"].split(","))
             # square crop around the damaged area, at least 260px, with margin
-            side = max(260, int(max(x1 - x0, y1 - y0) * 1.6))
+            side = min(1200, max(260, int(max(x1 - x0, y1 - y0) * 1.6)))
             cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
             bx0, by0 = max(0, min(1200 - side, cx - side // 2)), max(0, min(1200 - side, cy - side // 2))
             box = (bx0, by0, bx0 + side, by0 + side)

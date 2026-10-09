@@ -823,14 +823,12 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1, logo_tpl_bgr=N
             light = box
         tplg[y:y + h, x:x + w] = np.minimum(tplg[y:y + h, x:x + w], logo_tpl[:h, :w].astype(np.float32) * (tone / 255.0))
         if tone < 235:
-            # the stamp's white glow around its strokes is invisible on white
-            # paper (and so absent from the template) but lightens a tinted
-            # face: pixels next to the strokes lighter than the face go too
-            face = light[np.abs(light - tone) <= 16]
-            sig = float(np.clip(face.std() if len(face) >= 20 else 20.0, 1.0, 20.0))
-            near = cv2.dilate(stroke0[:h, :w], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
-            glow = near & (gray0[y:y + h, x:x + w] > tone + max(5.0, 1.5 * sig))
-            mask[y:y + h, x:x + w][glow] = 255
+            # on skin, a backdrop or a tinted face the stamp's soft fringe,
+            # white glow and faint fill all show (on paper only its strokes
+            # do): its whole silhouette is rebuilt there, grown a little
+            hull = U.stamp_hull(logo_tpl, ink=250, close=7)[:h, :w]
+            hull = cv2.dilate(hull, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+            mask[y:y + h, x:x + w] = np.maximum(mask[y:y + h, x:x + w], hull)
     # a pixel clearly darker than the stamp's own stroke would be on the
     # face at that spot is ink or product showing through the translucent
     # stamp (a ruler digit, a dark link): it is kept, so the model only

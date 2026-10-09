@@ -730,8 +730,8 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
         inside[np.unique(dlab[(dev > 0) & ~near_foot])] = False
         # a broad patch is a leftover only when it is clearly off paper
         # somewhere (the eye's shadow); a broad faint one is soft shading
-        strong = np.zeros(nd, bool)
-        strong[np.unique(dlab[devv >= 25])] = True
+        strong_px = np.bincount(dlab[devv >= 25], minlength=nd)
+        strong = strong_px >= 0.3 * np.maximum(dst_[:, 4], 1)
         inside[1:] &= (dst_[1:, 4] <= 4000) | strong[1:]
         inside[0] = False
         left = inside[dlab] & ~real_near

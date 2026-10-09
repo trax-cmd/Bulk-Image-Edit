@@ -703,19 +703,19 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1, logo_tpl_bgr=N
         return bgr, None
     th, tw = logo_tpl.shape
     stroke0 = (logo_tpl < stroke_thresh).astype(np.uint8) * 255
-    core0 = (logo_tpl < 200).astype(np.uint8) * 255
     mask = np.zeros(bgr.shape[:2], np.uint8)
-    core = np.zeros(bgr.shape[:2], np.uint8)
+    tplg = np.full(bgr.shape[:2], 255, np.int16)
     for x, y, _ in hits:
         h = min(th, mask.shape[0] - y)
         w = min(tw, mask.shape[1] - x)
         mask[y:y + h, x:x + w] = np.maximum(mask[y:y + h, x:x + w], stroke0[:h, :w])
-        core[y:y + h, x:x + w] = np.maximum(core[y:y + h, x:x + w], core0[:h, :w])
-    # over dark ink or a dark product the strokes' faint anti-aliased fringe
-    # changes nothing visible, so only the strokes' cores are rebuilt there:
-    # a narrower cut through a ruler digit leaves the model more of its shape
-    dark = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) < 110
-    mask[dark & (core == 0)] = 0
+        tplg[y:y + h, x:x + w] = np.minimum(tplg[y:y + h, x:x + w], logo_tpl[:h, :w].astype(np.int16))
+    # a pixel clearly darker than the stamp's own stroke would be on paper
+    # at that spot is ink or product showing through the translucent stamp
+    # (a ruler digit, a dark link): it is kept, so the model only bridges
+    # the stroke's own width through it instead of redrawing the digit
+    gray0 = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.int16)
+    mask[gray0 < tplg - 30] = 0
     k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     if plain_background(bgr, mask, dark=110):
         # on plain background the paper fill is exact; the model's paper
@@ -769,7 +769,7 @@ def _looks_like_ticks(gray_win, dark=200):
 _RULER_DBG = None  # set to a list to collect per-word intermediates (debugging only)
 
 
-def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, margin=4):
+def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, margin=4, hits=None, detect_only=False):
     """Find every 'TraxNYC' word printed on a ruler, at any of the sizes the
     catalogue uses, and fill it with the ruler's own background.
 
@@ -784,6 +784,11 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
     band_top = int(H * 0.3) + pad                      # rulers sit in the lower part of the frame
     sub = gray[band_top:, :]
     TH, TW = text_tpl.shape
+    if hits is not None:
+        # the words were found on the untouched image (before the stamps
+        # were removed, which can smear a word under a stamp beyond
+        # recognition); only the removal runs here
+        return _remove_ruler_words(bgr, text_tpl, hits, pad, margin, padded, gray, TH, TW)
     parts = [  # (name, template slice, acceptance test on the hit box in padded coords)
         ("full", text_tpl, lambda x, y, h, w: True),
         ("left", text_tpl[:, : int(TW * 0.45)], lambda x, y, h, w: x + w >= W + pad - 6),
@@ -899,6 +904,14 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 best = (float(mx), wx0 + loc[0], wy0 + loc[1], s2, th2, tw2)
         refined.append((best[1], best[2], best[3], best[0], best[4], best[5], name, part))
     kept = refined
+    if detect_only:
+        return kept
+    return _remove_ruler_words(bgr, text_tpl, kept, pad, margin, padded, gray, TH, TW)
+
+
+def _remove_ruler_words(bgr, text_tpl, kept, pad, margin, padded, gray, TH, TW):
+    """Fill the ruler words in `kept` (as found by remove_ruler_text)."""
+    H, W = bgr.shape[:2]
     out = padded.copy()
 
     def paper_tone(x, y, th, tw):
@@ -1331,6 +1344,12 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
         logo_hits = find_logo(bgr, logo_tpl)                 # detect on the untouched image
         logo_b = find_logo_b(bgr, logo_b_tpl, lettering_tpl) if logo_b_tpl is not None else None
         ruler_words = True
+    # the ruler words are found on the untouched image (a stamp over a word
+    # is removed first, and what the model leaves of the word under it may
+    # no longer match the template) and again once the stamps are gone (a
+    # stamp over a word can hide it from the first search); an earlier
+    # run's count is not trusted for this
+    word_hits = remove_ruler_text(bgr, text_tpl, detect_only=True)
     overlap, product_px = 0.0, 0
     # the stamps go first: a stamp lying over a ruler word would otherwise be
     # taken for a product over the word (its strokes kept, the word under
@@ -1348,8 +1367,13 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
         overlap = max(overlap, over_product(before, mask_a))
         product_px += product_near(before, mask_a)
     text_hits = []
-    if ruler_words:
-        bgr, text_hits = remove_ruler_text(bgr, text_tpl)
+    if logo_hits or logo_b is not None:
+        more = remove_ruler_text(bgr, text_tpl, detect_only=True)
+        for h in more:
+            if all(abs(h[0] - k[0]) > 20 or abs(h[1] - k[1]) > 10 for k in word_hits):
+                word_hits.append(h)
+    if word_hits:
+        bgr, text_hits = remove_ruler_text(bgr, text_tpl, hits=word_hits)
     clean = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
     final = clean if no_upscale else upscale(clean, size)
     info = {"logo_hits": logo_hits, "text_hits": text_hits, "logo_b": logo_b,

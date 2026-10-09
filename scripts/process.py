@@ -29,6 +29,7 @@ import numpy as np
 from PIL import Image
 
 import unblend as U
+from bridge import bridge_bands
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from upscale import EXTS, border_color  # noqa: E402
@@ -580,7 +581,11 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
             k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             out[cv2.dilate(inp, k3) > 0] = paper
         elif use_model:
-            out = rebuild(out, inp, grow=2)
+            # a thin smooth band (a hoop, a shank) cut by the opaque parts is
+            # joined up first; the model then only blends the join's edges
+            out, inp_m, _ = bridge_bands(out, inp)
+            out = rebuild(out, inp_m, grow=2)
+            inp = inp_m
         else:
             out = cv2.inpaint(out, inp, 3, cv2.INPAINT_TELEA)
         # 4b. a rebuilt patch on background comes out faintly grey: snap it
@@ -871,6 +876,10 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
     cands = []
     for sc in RULER_TEXT_SCALES:
         for name, part, accept in parts:
+            # the small sizes are rows of repeated whole words: a piece of a
+            # word a few pixels tall matches too much else
+            if sc < 0.8 and name != "full":
+                continue
             th, tw = round(part.shape[0] * sc), round(part.shape[1] * sc)
             if th >= sub.shape[0] or tw >= sub.shape[1] or th < 6 or tw < 10:
                 continue
@@ -896,7 +905,17 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
     # the whole word and the large partials are accepted on their own score;
     # the small partials (two or three letters) match ruler digits too, so
     # they only count beside a whole word on the same baseline
-    direct = [c[:8] for c in cands if c[6] not in SMALL and c[3] >= c[8]]
+    # a small word (under 0.8 of the template) counts only at a good score
+    # and beside another small word of the same size on the same baseline:
+    # at that size a lone match is as likely a scrap of product or shadow
+    small_full = [c for c in cands if c[6] == "full" and c[2] < 0.8]
+    def small_ok(c):
+        if c[3] >= 0.5:
+            return True
+        return c[3] >= thresh and any(o is not c and o[3] >= 0.38 and abs(c[2] - o[2]) <= 0.16
+                                      and abs(c[1] + c[4] - (o[1] + o[4])) <= 0.5 * c[4]
+                                      and abs(c[0] - o[0]) >= 0.8 * c[5] for o in small_full)
+    direct = [c[:8] for c in cands if c[6] not in SMALL and c[3] >= c[8] and (c[2] >= 0.8 or small_ok(c))]
     full_direct = [c for c in direct if c[6] == "full"]
     hits = list(direct)
     # a second word on the same baseline, at the same size, as an accepted
@@ -909,7 +928,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         if name in SMALL:
             ok = need < 9 and score >= 0.5 and aligned(c, full_direct)
         elif name == "full":
-            ok = score >= 0.36 and aligned(c, direct)
+            ok = score >= (thresh if sc < 0.8 else 0.36) and aligned(c, direct)
         else:
             ok = score >= 0.45 and aligned(c, direct)
         if ok:
@@ -1413,6 +1432,11 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
         logo_hits = find_logo(bgr, logo_tpl)                 # detect on the untouched image
         logo_b = find_logo_b(bgr, logo_b_tpl, lettering_tpl) if logo_b_tpl is not None else None
         ruler_words = True
+    # on a frame carrying the grey stamp, a weak match of the coloured stamp
+    # is the grey stamp's own lettering (the same face) or a piece of the
+    # product: only a strong match counts there
+    if logo_hits and logo_b is not None and logo_b[3] < 0.8:
+        logo_b = None
     # the ruler words are found on the untouched image (a stamp over a word
     # is removed first, and what the model leaves of the word under it may
     # no longer match the template) and again once the stamps are gone (a

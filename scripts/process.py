@@ -317,9 +317,15 @@ def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.5, big_thresh=0.85, color_
             # on a grey frame the translucent eye prints as a muted pink, so
             # a strong lettering match needs less of it
             need = color_thresh if score < 0.6 else min(color_thresh, 0.3)
-            if _maroon_fraction(padded, red_mask, sx, sy, sc) < need:
+            mf = _maroon_fraction(padded, red_mask, sx, sy, sc)
+            if mf < need:
                 continue
-            if not _stamp_b_confirmed(padded, tpl_bgr, lettering_tpl, lx, ly, sx, sy, sc, score):
+            # a candidate the proven rules accept (usual sizes, the eye's
+            # maroon in full, below the top of the frame) stands; one found
+            # only by the wider search (a larger size, a muted eye, the top
+            # of the frame) must also show the lettering's own colours
+            usual = sc <= 1.7 and mf >= color_thresh and ly >= max(0, int(H * 0.35) - pad)
+            if not usual and not _stamp_b_confirmed(padded, tpl_bgr, lettering_tpl, lx, ly, sx, sy, sc, score):
                 continue
             if best is None or score > best[3]:
                 best = (lx, ly, sc, score)
@@ -345,8 +351,6 @@ def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.5, big_thresh=0.85, color_
                 lx, ly = x0 + wx, y0 + wy
                 sx, sy = stamp_origin(lx, ly, sc)
                 if _maroon_fraction(padded, red_mask, sx, sy, sc) < 0.25:
-                    continue
-                if not _stamp_b_confirmed(padded, tpl_bgr, lettering_tpl, lx, ly, sx, sy, sc, float(mx)):
                     continue
                 if best is None or mx > best[3]:
                     best = (lx, ly, sc, float(mx))

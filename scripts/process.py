@@ -704,18 +704,47 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1, logo_tpl_bgr=N
     th, tw = logo_tpl.shape
     stroke0 = (logo_tpl < stroke_thresh).astype(np.uint8) * 255
     mask = np.zeros(bgr.shape[:2], np.uint8)
-    tplg = np.full(bgr.shape[:2], 255, np.int16)
+    tplg = np.full(bgr.shape[:2], 255, np.float32)
+    gray0 = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.int16)
     for x, y, _ in hits:
         h = min(th, mask.shape[0] - y)
         w = min(tw, mask.shape[1] - x)
+        st = stroke0[:h, :w] > 0
         mask[y:y + h, x:x + w] = np.maximum(mask[y:y + h, x:x + w], stroke0[:h, :w])
-        tplg[y:y + h, x:x + w] = np.minimum(tplg[y:y + h, x:x + w], logo_tpl[:h, :w].astype(np.int16))
-    # a pixel clearly darker than the stamp's own stroke would be on paper
-    # at that spot is ink or product showing through the translucent stamp
-    # (a ruler digit, a dark link): it is kept, so the model only bridges
-    # the stroke's own width through it instead of redrawing the digit
-    gray0 = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.int16)
-    mask[gray0 < tplg - 30] = 0
+        # the template is the stamp printed on white; on a grey or tinted
+        # ruler face the same translucent stamp prints darker in proportion
+        # to the face, so the expected stroke level is scaled by the face's
+        # tone (the light majority of the box outside the strokes)
+        box = gray0[y:y + h, x:x + w][~st]
+        light = box[box > 120]
+        tone = 255.0
+        if len(light) >= 50 and len(light) >= 0.3 * len(box):
+            tone = float(np.median(light))
+            if tone >= 235:
+                tone = 255.0
+        tplg[y:y + h, x:x + w] = np.minimum(tplg[y:y + h, x:x + w], logo_tpl[:h, :w].astype(np.float32) * (tone / 255.0))
+        if tone < 235:
+            # the stamp's white glow around its strokes is invisible on white
+            # paper (and so absent from the template) but lightens a tinted
+            # face: pixels next to the strokes lighter than the face go too
+            face = light[np.abs(light - tone) <= 16]
+            sig = float(np.clip(face.std() if len(face) >= 20 else 20.0, 1.0, 20.0))
+            near = cv2.dilate(stroke0[:h, :w], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))) > 0
+            glow = near & (gray0[y:y + h, x:x + w] > tone + max(5.0, 2.5 * sig))
+            mask[y:y + h, x:x + w][glow] = 255
+    # a pixel clearly darker than the stamp's own stroke would be on the
+    # face at that spot is ink or product showing through the translucent
+    # stamp (a ruler digit, a dark link): it is kept, so the model only
+    # bridges the stroke's own width through it instead of redrawing the digit
+    kept = ((mask > 0) & (gray0 < tplg - 30)).astype(np.uint8)
+    # a dark speck of a few pixels inside a stroke is the stamp's own
+    # (JPEG-darkened) ink, not a digit or a link showing through
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(kept, connectivity=8)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < 6:
+            kept[lab == i] = 0
+    kept = kept > 0
+    mask[kept] = 0
     k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     if plain_background(bgr, mask, dark=110):
         # on plain background the paper fill is exact; the model's paper
@@ -727,7 +756,47 @@ def remove_logo(bgr, logo_tpl, hits, stroke_thresh=250, dilate=1, logo_tpl_bgr=N
         k4 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         out = U.snap_background(out, cv2.dilate(mask, k4), paper, light=225, flat=8.0)
         return out, mask
-    return rebuild(bgr, mask, grow=dilate), mask
+    out = rebuild(bgr, mask, grow=dilate)
+    return settle_face(out, bgr, mask, kept), mask
+
+
+def settle_face(out, src, mask, kept, grow=4, tol_k=3.0, tol_min=8, share=0.6, damp=0.3):
+    """After the model rebuilt the strokes of a stamp lying on a plain face
+    (white paper or a grey or tinted ruler face), the rebuilt pixels and the
+    face's JPEG ringing around the strokes are a little rougher than the
+    face itself (std 4-5 against a face's 2), which the upscale's sharpening
+    shows as a faint ghost of the stamp. Where the surroundings are a plain
+    face, the deviations from its tone inside the strokes and a `grow` px
+    band around them are damped. Pixels not close to the face tone (ink,
+    product, their anti-aliased edges), the ink and product kept out of
+    the mask with a 3px margin, and anything whose neighbourhood is not
+    mostly face-toned are left alone."""
+    k = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    m = (mask > 0).astype(np.uint8)
+    far = (cv2.dilate(m, k(14)) > 0) & (cv2.dilate(m, k(8)) == 0)
+    gsrc = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    vals = gsrc[far]
+    if len(vals) < 100:
+        return out
+    hist, edges = np.histogram(vals, bins=np.arange(0, 260, 4))
+    mode = float(edges[int(np.argmax(hist))] + 2)
+    facepx = far & (np.abs(gsrc - mode) <= 12)
+    if mode < 120 or facepx.sum() < share * far.sum():
+        return out
+    tone = np.median(src[facepx].astype(np.float32), axis=0)
+    sigma = float(np.clip(gsrc[facepx].std(), 1.0, 20.0))
+    tol = max(tol_min, tol_k * sigma)
+    region = (cv2.dilate(m, k(grow)) > 0) & (cv2.dilate(kept.astype(np.uint8), k(3)) == 0)
+    dev = out.astype(np.float32) - tone
+    adev = np.abs(dev).max(axis=2)
+    near = adev <= tol
+    frac = cv2.blur(near.astype(np.float32), (7, 7))
+    # a lump the model left (a few pixels, up to ~20 levels off) counts as
+    # face too when its neighbourhood is mostly face-toned
+    sel = region & (adev <= max(2.0 * tol, 18.0)) & (frac >= share)
+    res = out.copy()
+    res[sel] = np.clip(tone + damp * dev[sel], 0, 255).astype(np.uint8)
+    return res
 
 
 def plain_background(bgr, mask, dark=215, ring=6, far=(4, 10), dev=15, max_dark=15, max_dev=30):
@@ -748,7 +817,7 @@ def plain_background(bgr, mask, dark=215, ring=6, far=(4, 10), dev=15, max_dark=
     return int(((d > dev) & ring2).sum()) < max_dev
 
 
-RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3, 0.9, 0.8)
+RULER_TEXT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.45, 1.6, 1.75, 1.9, 2.1, 2.3, 0.9, 0.8, 0.7, 0.6, 0.55, 0.5)
 
 
 def _looks_like_ticks(gray_win, dark=200):
@@ -808,7 +877,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             t = cv2.resize(part, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_CUBIC)
             res = cv2.matchTemplate(sub, t, cv2.TM_CCOEFF_NORMED)
             need = thresh if name == "full" else (part_thresh + 0.08 if name in ("left30", "left20", "right30", "top35") else part_thresh)
-            for x, y, score in _top_k(res, 6, th, tw):
+            for x, y, score in _top_k(res, 8, th, tw):
                 yy = y + band_top
                 if score < (0.36 if name == "full" else 0.45):
                     continue

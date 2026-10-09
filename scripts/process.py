@@ -908,13 +908,18 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
     # a small word (under 0.8 of the template) counts only at a good score
     # and beside another small word of the same size on the same baseline:
     # at that size a lone match is as likely a scrap of product or shadow
-    small_full = [c for c in cands if c[6] == "full" and c[2] < 0.8]
+    def has_ink(c):
+        # a small template's correlation spikes on blank paper and on
+        # product texture: the window must hold ink in a word's proportion
+        x, y, sc, score, th, tw = c[:6]
+        win = gray[y:y + th, x:x + tw].astype(np.int16)
+        if win.size == 0:
+            return False
+        fill = float(np.median(win))
+        frac = float((win < fill - 40).mean())
+        return 0.05 <= frac <= 0.5
     def small_ok(c):
-        if c[3] >= 0.5:
-            return True
-        return c[3] >= thresh and any(o is not c and o[3] >= 0.38 and abs(c[2] - o[2]) <= 0.16
-                                      and abs(c[1] + c[4] - (o[1] + o[4])) <= 0.5 * c[4]
-                                      and abs(c[0] - o[0]) >= 0.8 * c[5] for o in small_full)
+        return c[3] >= 0.5 and has_ink(c)
     direct = [c[:8] for c in cands if c[6] not in SMALL and c[3] >= c[8] and (c[2] >= 0.8 or small_ok(c))]
     full_direct = [c for c in direct if c[6] == "full"]
     hits = list(direct)
@@ -928,7 +933,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         if name in SMALL:
             ok = need < 9 and score >= 0.5 and aligned(c, full_direct)
         elif name == "full":
-            ok = score >= (thresh if sc < 0.8 else 0.36) and aligned(c, direct)
+            ok = score >= (thresh if sc < 0.8 else 0.36) and aligned(c, direct) and (sc >= 0.8 or has_ink(c))
         else:
             ok = score >= 0.45 and aligned(c, direct)
         if ok:

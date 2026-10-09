@@ -873,7 +873,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             extra.append((rx0 + loc[0], ry0 + loc[1], sc, float(mx), fth, ftw, "full", text_tpl))
     hits = extra + hits
     if not hits:
-        return bgr, []
+        return [] if detect_only else (bgr, [])
     # full-word hits win over partials; among partials the one showing more
     # of the word wins, so a short piece cannot land on the wrong letters
     hits.sort(key=lambda h: (h[6] != "full", -h[5], -h[3]))

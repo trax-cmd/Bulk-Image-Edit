@@ -623,10 +623,12 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
     trans[inp > 0] = 0
     region = np.maximum(inp, trans)
     paper = U.paper_tone(bgr, region, ring=12, light=light)
-    # what lies under the stamp: paper (white, neutral) or not (skin, a backdrop)
-    fp = bgr[footprint].astype(np.int16)
-    paper_share = float(((fp.min(axis=1) >= light) & (fp.max(axis=1) - fp.min(axis=1) <= 20)).mean()) if len(fp) else 1.0
-    no_paper = paper_share < 0.3
+    # what lies under the stamp's translucent parts once they are undone:
+    # paper (white, neutral) or not (skin, a backdrop)
+    under = (trans > 0) & (inp == 0)
+    fp = out[under].astype(np.int16)
+    paper_share = float(((fp.min(axis=1) >= light) & (fp.max(axis=1) - fp.min(axis=1) <= 20)).mean()) if len(fp) >= 50 else 1.0
+    no_paper = paper_share < 0.5
     if no_paper and use_model:
         # on skin or a dark backdrop the arithmetic undo of the translucent
         # parts (which assumes paper under them) leaves a pale ghost of the

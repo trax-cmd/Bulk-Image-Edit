@@ -233,6 +233,44 @@ LETTERING_OFFSET = (100, 114)     # top-left of the lettering band inside the st
 LETTERING_SCALES = (1.0, 1.1, 1.2, 1.3, 0.9, 1.4, 1.5, 1.6, 1.7, 1.9, 2.1, 2.3)   # up to 2.3 on the portrait frames
 
 
+def _flame_grey_fraction(bgr, flame_mask_tpl, x, y, scale):
+    """Share of the stamp's flame body (silhouette minus the eye) that is
+    grey in the image: the translucent grey flame over paper or metal is
+    neutral, while a ruby, a garnet or a pink photo under a false match is
+    coloured throughout."""
+    win, m = _window(bgr, x, y, _scaled_mask(flame_mask_tpl, scale))
+    if win is None or m.sum() < 60:
+        return 0.0
+    win = win.astype(int)
+    b, g, r = win[..., 0][m], win[..., 1][m], win[..., 2][m]
+    chroma = np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)
+    gray = (r + g + b) // 3
+    return float(((chroma <= 25) & (gray >= 60) & (gray <= 240)).mean())
+
+
+def _stamp_b_confirmed(padded, tpl_bgr, lettering_tpl, lx, ly, sx, sy, sc, score):
+    """Beyond the maroon of the eye: the lettering box is neutral and the
+    flame body is largely grey (or the lettering match is very strong)."""
+    th, tw = round(lettering_tpl.shape[0] * sc), round(lettering_tpl.shape[1] * sc)
+    box = padded[max(0, ly):ly + th, max(0, lx):lx + tw].astype(np.int16)
+    if box.size == 0:
+        return False
+    chroma = box.max(axis=2) - box.min(axis=2)
+    g = box.mean(axis=2)
+    bright = float(((g > 200) & (chroma <= 30)).mean())      # the letters' white
+    dark = float((g < 110).mean())                            # their outline, never a solid dark mass
+    if np.percentile(chroma, 25) > 10 or bright < 0.2:
+        return False
+    if score >= 0.75 or dark <= 0.3:
+        return True
+    tg = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+    tb, tg_, tr = cv2.split(tpl_bgr.astype(int))
+    red = ((tr - np.maximum(tg_, tb)) > 20).astype(np.uint8)
+    flame = (U.stamp_hull(tg) > 0) & (cv2.dilate(red, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) == 0)
+    flame[LETTERING_OFFSET[1] - 4:] = False          # not the lettering rows
+    return _flame_grey_fraction(padded, flame.astype(np.uint8), sx, sy, sc) >= 0.5
+
+
 def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.5, big_thresh=0.85, color_thresh=0.5, topk=3):
     """Locate the large coloured TraxNYC stamp via its 'TraxNYC' lettering.
 
@@ -281,6 +319,8 @@ def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.5, big_thresh=0.85, color_
             need = color_thresh if score < 0.6 else min(color_thresh, 0.3)
             if _maroon_fraction(padded, red_mask, sx, sy, sc) < need:
                 continue
+            if not _stamp_b_confirmed(padded, tpl_bgr, lettering_tpl, lx, ly, sx, sy, sc, score):
+                continue
             if best is None or score > best[3]:
                 best = (lx, ly, sc, score)
     if best is None and W < 900:
@@ -306,10 +346,20 @@ def find_logo_b(bgr, tpl_bgr, lettering_tpl, thresh=0.5, big_thresh=0.85, color_
                 sx, sy = stamp_origin(lx, ly, sc)
                 if _maroon_fraction(padded, red_mask, sx, sy, sc) < 0.25:
                     continue
+                if not _stamp_b_confirmed(padded, tpl_bgr, lettering_tpl, lx, ly, sx, sy, sc, float(mx)):
+                    continue
                 if best is None or mx > best[3]:
                     best = (lx, ly, sc, float(mx))
     if best is None:
-        return _find_logo_b_masked(bgr, tpl_bgr)
+        fb = _find_logo_b_masked(bgr, tpl_bgr)
+        if fb is None:
+            return None
+        # the whole-stamp match is confirmed the same way
+        fx, fy, fsc, fscore = fb
+        lx, ly = round(fx + ox * fsc) + pad, round(fy + oy * fsc) - y_off
+        if _stamp_b_confirmed(padded, tpl_bgr, lettering_tpl, lx, ly, fx + pad, fy - y_off, fsc, fscore):
+            return fb
+        return None
     lx, ly, sc, score = best
     base = sc
     cx, cy = lx + lettering_tpl.shape[1] * sc / 2, ly + lettering_tpl.shape[0] * sc / 2
@@ -903,7 +953,9 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
                 cands.append((x, yy, sc, score, th, tw, name, part, need if accept(x, yy, th, tw) else 9.0))
     def aligned(c, others):
         x, y, sc, score, th, tw = c[:6]
-        return any(abs(y + th - (oy + oth)) <= 0.2 * th and abs(sc - osc) <= 0.16 for ox, oy, osc, _, oth, *_ in others)
+        # below full size the anchor word must itself be a confident match
+        return any(abs(y + th - (oy + oth)) <= 0.2 * th and abs(sc - osc) <= 0.16 and (sc >= 1.0 or osc_score >= 0.55)
+                   for ox, oy, osc, osc_score, oth, *_ in others)
     SMALL = ("left30", "left20", "right30")
     # the whole word and the large partials are accepted on their own score;
     # the small partials (two or three letters) match ruler digits too, so
@@ -911,11 +963,14 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
     # a small word (under 0.8 of the template) counts only at a good score
     # and beside another small word of the same size on the same baseline:
     # at that size a lone match is as likely a scrap of product or shadow
-    def looks_like_word(c):
+    def looks_like_word(c, partial=False):
         # the printed word has tall letters (T, N, Y, C) and short ones
         # (r, a, x) side by side; a row of stones, a chain, a "mm" label or
-        # blank paper does not
+        # blank paper does not. Only the smaller sizes need this: a large
+        # template is specific enough on its own
         x, y, sc, score, th, tw = c[:6]
+        if sc >= 1.0:
+            return True
         win = gray[y:y + th, x:x + tw].astype(np.int16)
         if win.size == 0:
             return False
@@ -934,6 +989,13 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         tall = int((hs >= 0.75 * hmax).sum())
         short = int(((hs >= 0.45 * hmax) & (hs < 0.75 * hmax)).sum())
         span = (st[:, 0] + st[:, 2]).max() - st[:, 0].min()
+        if partial:
+            # a word half hidden by the product shows a few letters
+            return len(st) >= 2 and tall >= 1 and span >= 0.4 * tw
+        if sc < 0.8:
+            # a small print must show most of its letters (a stud and its
+            # post make three blobs of the right heights)
+            return len(st) >= 4 and tall >= 2 and short >= 2 and span >= 0.6 * tw
         return tall >= 2 and short >= 1 and span >= 0.6 * tw
     def has_ink(c):
         # a small template's correlation spikes on blank paper and on
@@ -946,9 +1008,17 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
         frac = float((win < fill - 40).mean())
         return 0.05 <= frac <= 0.5
     def small_ok(c):
-        return c[3] >= 0.5 and has_ink(c)
-    direct = [c[:8] for c in cands if c[6] not in SMALL and c[3] >= c[8] and (c[2] >= 0.8 or small_ok(c))
-              and (c[6] != "full" or c[3] >= 0.55 or looks_like_word(c))]
+        return c[3] >= 0.5 and has_ink(c) and (c[3] >= 0.6 or looks_like_word(c))
+    def direct_ok(c):
+        if c[6] in SMALL or c[3] < c[8]:
+            return False
+        if c[2] < 0.8:
+            return small_ok(c)
+        if c[6] == "full" and c[2] < 1.0:
+            # the mid sizes match stones, studs and digit rows at 0.4-0.5
+            return c[3] >= 0.5 and (c[3] >= 0.55 or looks_like_word(c))
+        return True
+    direct = [c[:8] for c in cands if direct_ok(c)]
     full_direct = [c for c in direct if c[6] == "full"]
     hits = list(direct)
     # a second word on the same baseline, at the same size, as an accepted
@@ -962,7 +1032,7 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             ok = need < 9 and score >= 0.5 and aligned(c, full_direct)
         elif name == "full":
             ok = score >= (thresh if sc < 0.8 else 0.36) and aligned(c, direct) and (sc >= 0.8 or has_ink(c)) \
-                and (score >= 0.55 or looks_like_word(c))
+                and (score >= 0.55 or looks_like_word(c, partial=True))
         else:
             ok = score >= 0.45 and aligned(c, direct)
         if ok:
@@ -1025,7 +1095,9 @@ def remove_ruler_text(bgr, text_tpl, thresh=0.42, part_thresh=0.52, pad=120, mar
             if mx > best[0] + 0.01:
                 best = (float(mx), wx0 + loc[0], wy0 + loc[1], s2, th2, tw2)
         refined.append((best[1], best[2], best[3], best[0], best[4], best[5], name, part))
-    kept = refined
+    # a small print's match improves markedly once its size is refined; a
+    # stud, a shadow or a scrap of chain matched at the coarse size does not
+    kept = [h for h in refined if not (h[2] < 0.8 and h[6] == "full" and h[3] < 0.58)]
     if detect_only:
         return kept
     return _remove_ruler_words(bgr, text_tpl, kept, pad, margin, padded, gray, TH, TW)
@@ -1477,6 +1549,18 @@ def process_image(path: Path, logo_tpl, text_tpl, size: int, no_upscale: bool = 
     # stamp over a word can hide it from the first search); an earlier
     # run's count is not trusted for this
     word_hits = remove_ruler_text(bgr, text_tpl, detect_only=True)
+    if logo_hits:
+        # the grey stamp's own small "TRAXNYC" matches the word template:
+        # a word lying over the stamp's box is the stamp (removed with it)
+        th_a, tw_a = logo_tpl.shape
+        def over_stamp(h):
+            x, y, th, tw = h[0] - 120, h[1] - 120, h[4], h[5]
+            for ax, ay, _ in logo_hits:
+                ix = max(0, min(x + tw, ax + tw_a) - max(x, ax)); iy = max(0, min(y + th, ay + th_a) - max(y, ay))
+                if ix * iy >= 0.3 * th * tw:
+                    return True
+            return False
+        word_hits = [h for h in word_hits if not over_stamp(h)]
     overlap, product_px = 0.0, 0
     # the stamps go first: a stamp lying over a ruler word would otherwise be
     # taken for a product over the word (its strokes kept, the word under

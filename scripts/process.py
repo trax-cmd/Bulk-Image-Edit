@@ -691,7 +691,12 @@ def remove_stamp_b(bgr, tpl_bgr, x, y, scale, grey=70.0, light=215, use_model=Tr
         n2, lab2, st2, _ = cv2.connectedComponentsWithStats(prod2, connectivity=8)
         real = np.zeros(n2, bool)
         real[np.unique(lab2[dark_any & (prod2 > 0)])] = True
-        real[1:] |= st2[1:, 4] >= 1500      # a large pale thing (a blurred shank) is real too
+        # a large pale thing is real too (a blurred shank), but only when it
+        # continues beyond the stamp's reach: the eye's unblended shadow is
+        # a large pale blob that lies wholly within it
+        beyond = np.zeros(n2, bool)
+        beyond[np.unique(lab2[(prod2 > 0) & ~near_foot])] = True
+        real[1:] |= (st2[1:, 4] >= 1500) & beyond[1:]
         real[0] = False
         real_near = cv2.dilate(real[lab2].astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
         dev = (np.abs(out.astype(np.int16) - paper.astype(np.int16)).max(axis=2) > 8).astype(np.uint8)

@@ -1,0 +1,604 @@
+<title>TraxNYC Image Review</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a sticky bench bar (counts, search, filters, size) over a windowed grid of
+   ORIGINAL | CORRECTED pairs; a lightbox opens one pair big with hold-to-compare. */
+:root {
+  --bg: #f6f5f2;        /* warm paper, so white product photos read as objects */
+  --panel: #ffffff;
+  --fg: #1d1b17;
+  --muted: #6b665c;
+  --line: #dcd8cf;
+  --accent: #8a6d1f;    /* brass */
+  --accent-fg: #ffffff;
+  --bad: #b3261e;       /* problem mark */
+  --bad-soft: #fbe9e7;
+  --warn: #9a5b00;
+  --warn-soft: #fff1dc;
+  --shade: rgba(29,27,23,.08);
+  --overlay: rgba(20,18,14,.86);
+  --font: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161513; --panel: #201e1b; --fg: #ece8df; --muted: #a39c8e; --line: #363229;
+    --accent: #d4b35a; --accent-fg: #1d1b17; --bad: #ff6b5e; --bad-soft: #3a1f1c;
+    --warn: #e5a44a; --warn-soft: #3a2a12; --shade: rgba(0,0,0,.35);
+    --overlay: rgba(0,0,0,.9); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161513; --panel: #201e1b; --fg: #ece8df; --muted: #a39c8e; --line: #363229;
+  --accent: #d4b35a; --accent-fg: #1d1b17; --bad: #ff6b5e; --bad-soft: #3a1f1c;
+  --warn: #e5a44a; --warn-soft: #3a2a12; --shade: rgba(0,0,0,.35);
+  --overlay: rgba(0,0,0,.9); color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+img { max-width: 100%; }
+html { scrollbar-gutter: stable; }
+html, body { min-height: 100%; }
+body { overflow-anchor: none; }
+body { background: var(--bg); color: var(--fg); font-family: var(--font); font-size: 14px; line-height: 1.4; }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--panel); }
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: default; opacity: .55; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.bar { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line);
+  padding-block: 10px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.bar-inner { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+.brand { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; min-width: 0; }
+.brand h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: .01em; white-space: nowrap; }
+.counts { color: var(--muted); font-variant-numeric: tabular-nums; }
+.counts b { color: var(--fg); font-weight: 600; }
+.search { display: flex; align-items: center; gap: 6px; }
+.search input { width: 190px; max-width: 48vw; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); font-family: var(--mono); font-size: 13px; }
+.lbl { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; margin-right: 2px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip { border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 4px 11px; font-size: 13px; line-height: 1.2; }
+.chip[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.chip.bad[aria-pressed="true"] { background: var(--bad); border-color: var(--bad); color: #fff; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button { padding: 4px 10px; background: var(--bg); border: 0; font-size: 13px; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+.resume, .more { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; padding: 5px 10px; font-size: 13px; }
+.more { display: none; }
+.note { width: 100%; color: var(--muted); font-size: 12.5px; }
+.note.bad { color: var(--bad); }
+@media (max-width: 720px) {
+  .more { display: inline-block; }
+  .bar:not(.open) .fold { display: none; }
+  .bar:not(.open) .note:not(.bad) { display: none; }
+}
+
+.wrap { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 14px 40px; }
+.grid { position: relative; width: 100%; }
+.tile { position: absolute; top: 0; left: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; display: flex; flex-direction: column; }
+.tile.flagged { border-color: var(--bad); box-shadow: 0 0 0 2px var(--bad); }
+.pair { position: relative; display: block; flex: none; width: 100%; background-repeat: no-repeat; background-color: #fff; cursor: zoom-in; border: 0; padding: 0; }
+.pair .cap { position: absolute; top: 4px; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; padding: 1px 5px; border-radius: 3px; background: rgba(255,255,255,.82); color: #333; pointer-events: none; }
+.pair .cap.o { left: 4px; }
+.pair .cap.c { left: calc(50% + 4px); }
+.pair.solo .cap.o { display: none; }
+.pair.solo .cap.c { left: 4px; }
+.pair .seam { position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: var(--line); pointer-events: none; }
+.pair.solo .seam { display: none; }
+.meta { display: flex; align-items: center; gap: 6px; height: 34px; flex: none; padding: 0 8px; font-size: 12px; min-width: 0; }
+.meta .id { font-family: var(--mono); font-weight: 500; white-space: nowrap; }
+.meta .pos { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.meta .tags { display: flex; gap: 4px; flex-wrap: nowrap; overflow: hidden; min-width: 0; flex: 1; }
+.tag { font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: var(--shade); color: var(--muted); white-space: nowrap; }
+.tag.major { background: var(--bad-soft); color: var(--bad); }
+.tag.minor { background: var(--warn-soft); color: var(--warn); }
+.meta .flag { margin-left: auto; border: 1px solid var(--line); background: transparent; border-radius: 5px; padding: 2px 8px; font-size: 12px; line-height: 1.3; white-space: nowrap; }
+.meta .flag.on { background: var(--bad); border-color: var(--bad); color: #fff; }
+.tile.s .meta .tags, .tile.s .meta .pos { display: none; }
+.empty { padding: 40px 0; color: var(--muted); text-align: center; }
+
+/* lightbox */
+.lb { position: fixed; inset: 0; z-index: 20; background: var(--overlay); display: flex; flex-direction: column;
+  padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); color: #f2efe8; }
+.lb-top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding-block: 10px; }
+.lb-top .id { font-family: var(--mono); font-size: 15px; font-weight: 500; }
+.lb-top .name { color: #c9c3b6; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.lb-top .pos { color: #c9c3b6; font-variant-numeric: tabular-nums; }
+.lb button { border: 1px solid rgba(255,255,255,.35); background: rgba(255,255,255,.08); color: #f2efe8; border-radius: 6px; padding: 5px 11px; font-size: 13px; }
+.lb button.on { background: var(--bad); border-color: var(--bad); color: #fff; }
+.lb button.close { font-size: 18px; line-height: 1; padding: 3px 10px; }
+.stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; gap: 12px; }
+.view { position: relative; overflow: hidden; background: #fff; border-radius: 4px; touch-action: none; user-select: none; -webkit-user-select: none; cursor: zoom-in; }
+.view.zoomed { cursor: zoom-out; }
+.view .img { position: absolute; inset: 0; background-repeat: no-repeat; background-color: #fff; transform-origin: 50% 50%; transition: transform .12s ease; }
+@media (prefers-reduced-motion: reduce) { .view .img { transition: none; } }
+.view .lab { position: absolute; left: 6px; top: 6px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; background: rgba(255,255,255,.85); color: #333; padding: 2px 6px; border-radius: 3px; pointer-events: none; z-index: 1; }
+.view .lab.peek { background: var(--bad); color: #fff; }
+.lb-bottom { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding-block: 10px; }
+.lb-bottom .hint { color: #c9c3b6; font-size: 12.5px; }
+.lb-bottom .qa { width: 100%; font-size: 12.5px; color: #e9d7a8; }
+.lb-bottom .qa b { color: #fff; }
+.lb-bottom input { flex: 1; min-width: 160px; padding: 6px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,.35); background: rgba(255,255,255,.08); color: #fff; }
+.lb-bottom input::placeholder { color: #a9a294; }
+.nav { display: flex; gap: 6px; }
+@media (max-width: 720px) {
+  .stage { flex-direction: column; }
+  .lb-top .name { display: none; }
+  .lb-bottom .hint { display: none; }
+}
+</style>
+
+<div class="bar" id="bar">
+  <div class="bar-inner">
+    <div class="brand">
+      <h1>TraxNYC Image Review</h1>
+      <span class="counts" id="counts">loading…</span>
+    </div>
+    <label class="search"><span class="lbl">Item</span>
+      <input id="q" type="search" placeholder="63939 or ‘cuban’" autocomplete="off" spellcheck="false"></label>
+    <button class="more" id="more" aria-expanded="false">Filters</button>
+    <div class="chips fold" id="kinds"><span class="lbl">Removed</span>
+      <button class="chip" data-k="1" aria-pressed="false">grey stamp</button>
+      <button class="chip" data-k="2" aria-pressed="false">coloured stamp</button>
+      <button class="chip" data-k="4" aria-pressed="false">ruler words</button>
+      <button class="chip" data-k="0" aria-pressed="false">nothing</button>
+    </div>
+    <div class="chips fold" id="marks"><span class="lbl">Show</span>
+      <button class="chip" data-m="major" aria-pressed="false">my QA: major</button>
+      <button class="chip" data-m="minor" aria-pressed="false">my QA: minor</button>
+      <button class="chip bad" data-m="flagged" aria-pressed="false">flagged by you</button>
+    </div>
+    <div class="chips fold"><span class="lbl">View</span>
+      <div class="seg" id="mode"><button data-v="pair" aria-pressed="true">Original + corrected</button><button data-v="solo" aria-pressed="false">Corrected only</button></div>
+      <div class="seg" id="size"><button data-s="s" aria-pressed="false">S</button><button data-s="m" aria-pressed="true">M</button><button data-s="l" aria-pressed="false">L</button></div>
+      <button class="resume" id="resume" hidden>Resume at #0</button>
+    </div>
+    <div class="note" id="status">Click any pair to open it big. In the big view, press and hold on the corrected photo to see the original in the same spot.</div>
+  </div>
+</div>
+
+<div class="wrap" id="wrap">
+  <div class="grid" id="grid" tabindex="-1"></div>
+  <div class="empty" id="empty" hidden>No images match these filters.</div>
+</div>
+
+<div class="lb" id="lb" hidden role="dialog" aria-modal="true" aria-label="Image comparison">
+  <div class="lb-top">
+    <span class="id" id="lb-id"></span>
+    <span class="pos" id="lb-pos"></span>
+    <span class="name" id="lb-name"></span>
+    <span class="nav"><button id="lb-prev" title="Previous (←)">←</button><button id="lb-next" title="Next (→)">→</button></span>
+    <button class="close" id="lb-close" title="Close (Esc)">×</button>
+  </div>
+  <div class="stage" id="stage">
+    <div class="view" id="v-o"><div class="lab">Original</div><div class="img"></div></div>
+    <div class="view" id="v-c"><div class="lab">Corrected</div><div class="img"></div></div>
+  </div>
+  <div class="lb-bottom">
+    <button id="lb-flag">Flag as problem (F)</button>
+    <input id="lb-note" placeholder="What is wrong? (optional)" maxlength="300">
+    <span class="hint">Click a photo to zoom 2.5× at that spot. Hold on the corrected photo to see the original. ← → next pair.</span>
+    <div class="qa" id="lb-qa" hidden></div>
+  </div>
+</div>
+
+<script src="data.js"></script>
+<script>
+(function () {
+  const G = window.GALLERY;
+  const N = G.images.length;
+  const T = G.tile, PER = G.perRow * G.rows, SW = G.tile * 2 * G.perRow;
+  const num = s => (s.match(/^\d+/) || [s])[0];
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // position of each image within its item, item image counts, and a stable key per image
+  const itemCount = new Array(G.items.length).fill(0), pos = new Array(N), key = new Array(N), byKey = new Map();
+  for (let i = 0; i < N; i++) { const im = G.images[i]; pos[i] = ++itemCount[im[0]]; key[i] = G.items[im[0]] + '/' + im[1]; byKey.set(key[i], i); }
+  const spriteUrl = i => 'sprites/s' + String(Math.floor(i / PER)).padStart(3, '0') + '.webp';
+  const slot = i => { const j = i % PER; return { col: j % G.perRow, row: Math.floor(j / G.perRow) }; };
+  const $ = id => document.getElementById(id);
+  const DEFAULT_HINT = 'Click any pair to open it big. In the big view, press and hold on the corrected photo to see the original in the same spot.';
+
+  // ---------- state ----------
+  const SIZES = { s: 140, m: 200, l: 300 };
+  const META_H = 34, BORDER = 2;
+  const st = { q: '', kinds: new Set(), marks: new Set(), mode: 'pair', size: 'm', list: [], open: -1, openImg: -1, ins: 0, scanned: 0, ready: false };
+  const flags = new Map();       // image index -> {i, item, file, note, at}
+  const lastNote = new Map();    // image index -> last note text the reviewer gave it
+  let db = null, canWrite = null;
+  try { const s = JSON.parse(localStorage.getItem('trax-review') || '{}'); if (s.size in SIZES) st.size = s.size; if (s.mode === 'solo' || s.mode === 'pair') st.mode = s.mode; if (+s.scanned > 0) st.scanned = +s.scanned; } catch (e) {}
+  const persistLocal = () => { try { localStorage.setItem('trax-review', JSON.stringify({ size: st.size, mode: st.mode, scanned: st.scanned })); } catch (e) {} };
+  const unfiltered = () => !st.q && !st.kinds.size && !st.marks.size;
+
+  // ---------- filtering ----------
+  function matches(i) {
+    const im = G.images[i];
+    if (st.q) {
+      const q = st.q.toLowerCase(), name = G.items[im[0]].toLowerCase();
+      if (/^\d+$/.test(q) ? !num(name).startsWith(q) : !name.includes(q)) return false;
+    }
+    if (st.kinds.size) {
+      let ok = false;
+      for (const k of st.kinds) { if (k === 0 ? im[2] === 0 : (im[2] & k)) ok = true; }
+      if (!ok) return false;
+    }
+    if (st.marks.size) {
+      let ok = false;
+      if (st.marks.has('major') && im[4] === 2) ok = true;
+      if (st.marks.has('minor') && im[4] === 1) ok = true;
+      if (st.marks.has('flagged') && flags.has(i)) ok = true;
+      if (!ok) return false;
+    }
+    return true;
+  }
+  function refilter() {
+    st.list = [];
+    for (let i = 0; i < N; i++) if (matches(i)) st.list.push(i);
+    if (st.openImg >= 0) {
+      st.open = st.list.indexOf(st.openImg);            // -1 when the open image left the list
+      if (st.open < 0) { st.ins = st.list.findIndex(x => x > st.openImg); if (st.ins < 0) st.ins = st.list.length; }
+    }
+    layout(); renderCounts();
+    if (st.openImg >= 0) lbNav();
+  }
+
+  // ---------- windowed grid ----------
+  const grid = $('grid'), emptyEl = $('empty'), bar = $('bar');
+  const tiles = new Map(); // list position -> element
+  let cols = 1, tileW = 0, tileH = 0, imgW = 0, imgH = 0, gap = 10;
+  const barH = () => bar.offsetHeight + 8;
+  const rowH = () => tileH + gap;
+  function geometry() {
+    const w = grid.clientWidth, s = SIZES[st.size], pairW = st.mode === 'pair' ? s * 2 : s;
+    cols = Math.max(1, Math.floor((w + gap) / (pairW + gap)));
+    tileW = Math.floor((w - gap * (cols - 1)) / cols);
+    imgW = tileW - BORDER;                                   // drawable width inside the 1px borders
+    imgH = Math.round(st.mode === 'pair' ? imgW / 2 : imgW);
+    tileH = imgH + META_H + BORDER;
+  }
+  function layout() {
+    geometry();
+    const rows = Math.ceil(st.list.length / cols);
+    grid.style.height = (rows ? rows * rowH() - gap : 0) + 'px';
+    emptyEl.hidden = st.list.length > 0;
+    for (const el of tiles.values()) el.remove();
+    tiles.clear();
+    render();
+  }
+  function bg(i, el, w, solo) {
+    const { col, row } = slot(i), sc = w / (solo ? T : T * 2);
+    el.style.backgroundImage = 'url("' + spriteUrl(i) + '")';
+    el.style.backgroundSize = (SW * sc) + 'px auto';
+    el.style.backgroundPosition = (-(col * 2 * T + (solo ? T : 0)) * sc) + 'px ' + (-(row * T) * sc) + 'px';
+  }
+  function flagBtnState(f, i) {
+    const on = flags.has(i);
+    f.classList.toggle('on', on); f.textContent = on ? 'Flagged' : 'Flag';
+    f.disabled = !st.ready; f.hidden = canWrite === false;
+  }
+  function tileEl(li) {
+    const i = st.list[li], im = G.images[i], it = G.items[im[0]];
+    const el = document.createElement('div');
+    el.className = 'tile ' + st.size + (flags.has(i) ? ' flagged' : '');
+    el.dataset.i = i;
+    const r = Math.floor(li / cols), c = li % cols;
+    el.style.transform = 'translate(' + (c * (tileW + gap)) + 'px,' + (r * rowH()) + 'px)';
+    el.style.width = tileW + 'px'; el.style.height = tileH + 'px';
+    const solo = st.mode === 'solo';
+    const p = document.createElement('button');
+    p.className = 'pair' + (solo ? ' solo' : ''); p.style.height = imgH + 'px'; p.title = it;
+    p.setAttribute('aria-label', 'Open ' + num(it) + ' image ' + pos[i]);
+    bg(i, p, imgW, solo);
+    p.innerHTML = '<span class="cap o">Original</span><span class="cap c">Corrected</span><span class="seam"></span>';
+    p.addEventListener('click', () => openLb(i));
+    const m = document.createElement('div'); m.className = 'meta';
+    const tags = [];
+    if (im[2] & 1) tags.push('<span class="tag">grey</span>');
+    if (im[2] & 2) tags.push('<span class="tag">colour</span>');
+    if (im[2] & 4) tags.push('<span class="tag">ruler</span>');
+    if (im[4] === 2) tags.push('<span class="tag major">QA major' + (im[8] ? ' · re-run' : '') + '</span>');
+    if (im[4] === 1) tags.push('<span class="tag minor">QA minor' + (im[8] ? ' · re-run' : '') + '</span>');
+    m.innerHTML = '<span class="id">' + esc(num(it)) + '</span><span class="pos">' + pos[i] + '/' + itemCount[im[0]] + '</span><span class="tags">' + tags.join('') + '</span>';
+    const f = document.createElement('button'); f.className = 'flag'; flagBtnState(f, i);
+    f.title = 'Mark this image as a problem'; f.addEventListener('click', e => { e.stopPropagation(); toggleFlag(i); });
+    m.appendChild(f); el.appendChild(p); el.appendChild(m);
+    return el;
+  }
+  function gridTop() { return grid.getBoundingClientRect().top + window.scrollY; }
+  function render() {
+    if (!st.list.length) return;
+    const y0 = window.scrollY - gridTop(), y1 = y0 + window.innerHeight;
+    const r0 = Math.max(0, Math.floor(y0 / rowH()) - 1), r1 = Math.min(Math.ceil(st.list.length / cols) - 1, Math.ceil(y1 / rowH()) + 1);
+    const want = new Set();
+    for (let r = r0; r <= r1; r++) for (let c = 0; c < cols; c++) { const li = r * cols + c; if (li < st.list.length) want.add(li); }
+    for (const [li, el] of tiles) if (!want.has(li)) { el.remove(); tiles.delete(li); }
+    const frag = document.createDocumentFragment();
+    for (const li of want) if (!tiles.has(li)) { const el = tileEl(li); tiles.set(li, el); frag.appendChild(el); }
+    grid.appendChild(frag);
+  }
+  // The row under the bar, tolerant of the browser rounding a fractional scroll target (+1px), plus the offset inside it.
+  function viewAnchor() {
+    if (!st.list.length) return { i: -1, off: 0 };
+    const yRel = window.scrollY + barH() - gridTop() + 1;
+    const row = Math.max(0, Math.floor(yRel / rowH()));
+    const li = Math.min(st.list.length - 1, row * cols);
+    return { i: st.list[li], off: Math.max(0, Math.min(rowH() - 1, yRel - row * rowH() - 1)) };
+  }
+  function jumpTo(i, off) { // scroll so that image index i sits just under the bar (plus the offset it had inside its row)
+    const li = st.list.indexOf(i); if (li < 0) return;
+    window.scrollTo({ top: gridTop() + Math.floor(li / cols) * rowH() - barH() + (off || 0), behavior: 'auto' });
+  }
+  function keepView(fn) { // run a relayout and keep the same image under the bar
+    const a = viewAnchor(); fn(); if (a.i >= 0) jumpTo(a.i, a.off);
+  }
+  function trackProgress() { // only from real scrolling, only in the unfiltered view: rows fully above the bar count as scanned
+    if (!unfiltered() || !st.list.length) return;
+    const yRel = window.scrollY + barH() - gridTop() + 1;
+    const passed = Math.min(st.list.length, Math.max(0, Math.floor(yRel / rowH())) * cols);
+    if (passed > st.scanned) { st.scanned = passed; persistLocal(); scheduleProgress(); renderCounts(); }
+  }
+  let ticking = false;
+  window.addEventListener('scroll', () => { if (!ticking) { ticking = true; requestAnimationFrame(() => { ticking = false; render(); trackProgress(); }); } }, { passive: true });
+  function relayoutIfChanged() { // width or bar changes: relayout only when the geometry really changed, else just refresh the window
+    const oldCols = cols, oldH = tileH, a = viewAnchor();
+    geometry();
+    if (cols === oldCols && tileH === oldH) { render(); return; }
+    cols = oldCols; tileH = oldH; // restore so layout() recomputes from scratch
+    layout(); if (a.i >= 0) jumpTo(a.i, a.off);
+  }
+  window.addEventListener('resize', () => { relayoutIfChanged(); if (st.openImg >= 0) lbRender(); });
+  if (window.ResizeObserver) { let lastW = 0; new ResizeObserver(() => { const w = grid.clientWidth; if (w === lastW) return; const firstTime = lastW === 0; lastW = w; if (!firstTime) relayoutIfChanged(); }).observe(grid); }
+
+  function renderCounts() {
+    $('counts').innerHTML = '<b>' + st.list.length.toLocaleString() + '</b> of ' + N.toLocaleString() + ' images · ' + G.items.length.toLocaleString() + ' items · <b>' + flags.size + '</b> flagged' + (st.scanned ? ' · scrolled past ' + st.scanned.toLocaleString() : '');
+    const rb = $('resume'); rb.hidden = !(st.scanned > 0); rb.textContent = 'Resume at #' + st.scanned.toLocaleString();
+  }
+  $('resume').addEventListener('click', () => { clearFilters(); jumpTo(Math.min(st.scanned, N - 1)); });
+  function clearFilters() {
+    st.q = ''; $('q').value = ''; st.kinds.clear(); st.marks.clear();
+    document.querySelectorAll('#kinds .chip, #marks .chip').forEach(b => b.setAttribute('aria-pressed', 'false'));
+    window.scrollTo(0, 0); refilter();
+  }
+
+  // ---------- controls ----------
+  let qTimer = 0;
+  $('q').addEventListener('input', e => { clearTimeout(qTimer); qTimer = setTimeout(() => { st.q = e.target.value.trim(); window.scrollTo(0, 0); refilter(); }, 150); });
+  $('kinds').addEventListener('click', e => {
+    const b = e.target.closest('.chip'); if (!b) return; const k = +b.dataset.k, on = b.getAttribute('aria-pressed') !== 'true';
+    b.setAttribute('aria-pressed', on); on ? st.kinds.add(k) : st.kinds.delete(k); window.scrollTo(0, 0); refilter();
+  });
+  $('marks').addEventListener('click', e => {
+    const b = e.target.closest('.chip'); if (!b) return; const m = b.dataset.m, on = b.getAttribute('aria-pressed') !== 'true';
+    b.setAttribute('aria-pressed', on); on ? st.marks.add(m) : st.marks.delete(m); window.scrollTo(0, 0); refilter();
+  });
+  $('more').addEventListener('click', () => { keepView(() => { const open = bar.classList.toggle('open'); $('more').setAttribute('aria-expanded', open); geometry(); }); });
+  function seg(id, key, attr) {
+    const box = $(id);
+    box.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', b.dataset[attr] === st[key]));
+    box.addEventListener('click', e => {
+      const b = e.target.closest('button'); if (!b || b.dataset[attr] === st[key]) return;
+      keepView(() => { st[key] = b.dataset[attr]; box.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', x === b)); persistLocal(); layout(); });
+    });
+  }
+  seg('mode', 'mode', 'v'); seg('size', 'size', 's');
+
+  // ---------- flags (db, with browser-only fallback) ----------
+  const statusEl = $('status');
+  function setStatus(t, bad) { statusEl.textContent = t; statusEl.className = 'note' + (bad ? ' bad' : ''); }
+  function refreshFlagUI(only) {
+    for (const el of tiles.values()) { const i = +el.dataset.i; if (only != null && i !== only) continue; el.classList.toggle('flagged', flags.has(i)); flagBtnState(el.querySelector('.flag'), i); }
+    if (st.openImg >= 0 && (only == null || only === st.openImg)) lbFlagUI();
+    renderCounts();
+    if (st.marks.has('flagged')) refilter();
+  }
+  // document id: a stable hash of item/file, so flags survive a regenerated index
+  function docId(i) { let h = 5381; const s = key[i]; for (let k = 0; k < s.length; k++) h = ((h * 33) ^ s.charCodeAt(k)) >>> 0; return 'f' + h.toString(36) + '-' + s.length.toString(36); }
+  const pending = new Map();     // image index -> promise chain, so writes to one document never overlap
+  const wanted = new Map();      // image index -> last requested body (or null for delete) not yet started
+  const inflight = new Map();    // image index -> body being written right now
+  const lastSnap = new Map();    // what the store last reported
+  function writeFlag(i, on, note) {
+    if (!Number.isInteger(i) || i < 0 || !st.ready) return;
+    const im = G.images[i], body = on ? { i: i, item: G.items[im[0]], file: im[1], note: note || '', at: new Date().toISOString() } : null;
+    if (on) { flags.set(i, body); if (body.note) lastNote.set(i, body.note); } else flags.delete(i);
+    refreshFlagUI(i);
+    if (!db) { try { localStorage.setItem('trax-flags', JSON.stringify([...flags])); } catch (e) {} return; }
+    wanted.set(i, body);
+    const prev = (pending.get(i) || Promise.resolve()).catch(() => {});
+    const chain = prev.then(async () => {
+      if (!wanted.has(i)) return;                      // a later call in the burst already carried this state
+      const b = wanted.get(i); wanted.delete(i); inflight.set(i, b);
+      const ref = db.doc('flags/' + docId(i));
+      try {
+        for (let attempt = 0; ; attempt++) {
+          try { if (b) await ref.set(b); else await ref.delete(); break; }
+          catch (e) {
+            if (e && e.code === 'unavailable' && attempt === 0) { await new Promise(r => setTimeout(r, 400 + Math.random() * 600)); continue; }
+            inflight.delete(i);
+            if (!wanted.has(i)) { if (lastSnap.has(i)) flags.set(i, lastSnap.get(i)); else flags.delete(i); refreshFlagUI(i); }
+            if (e && e.code === 'invalid_argument') { canWrite = false; setStatus('Your flags cannot be saved from this account (read-only). Open the link from the account that owns this page.', true); refreshFlagUI(); }
+            else setStatus('Could not save that flag (' + ((e && e.code) || 'error') + '). Try again in a moment.', true);
+            return;
+          }
+        }
+        // confirmed: treat the written body as what the store holds
+        if (b) lastSnap.set(i, b); else lastSnap.delete(i);
+        inflight.delete(i);
+        if (!wanted.has(i)) { if (b) flags.set(i, b); else flags.delete(i); refreshFlagUI(i); }
+        if (statusEl.classList.contains('bad') && canWrite !== false) setStatus(DEFAULT_HINT);
+      } finally { inflight.delete(i); }
+    }).finally(() => { if (pending.get(i) === chain) pending.delete(i); });
+    pending.set(i, chain);
+  }
+  function toggleFlag(i, note) { const on = !flags.has(i); writeFlag(i, on, on ? (note || lastNote.get(i) || '') : ''); }
+  let progTimer = 0, lastProgWritten = 0, progChain = Promise.resolve();
+  function scheduleProgress() {
+    if (!db) return;
+    clearTimeout(progTimer);
+    progTimer = setTimeout(() => {
+      progChain = progChain.then(async () => {
+        if (st.scanned <= lastProgWritten) return; const v = st.scanned;
+        try { await db.doc('progress/main').set({ scanned: v, at: new Date().toISOString() }); lastProgWritten = Math.max(lastProgWritten, v); } catch (e) {}
+      });
+    }, 1500);
+  }
+  function setReady() { if (st.ready) return; st.ready = true; refreshFlagUI(); }
+  function mergeSnapshot() { // store state, then what is being written, then what is still queued: the newest intention wins
+    flags.clear();
+    for (const [i, b] of lastSnap) flags.set(i, b);
+    for (const [i, b] of inflight) { if (b) flags.set(i, b); else flags.delete(i); }
+    for (const [i, b] of wanted) { if (b) flags.set(i, b); else flags.delete(i); }
+  }
+  async function connect() {
+    setTimeout(() => { if (!st.ready) setReady(); }, 8000); // nothing may lock the controls forever
+    const use = n => { try { return (window.claude && typeof window.claude.use === 'function') ? Promise.resolve(window.claude.use(n)).catch(() => null) : Promise.resolve(null); } catch (e) { return Promise.resolve(null); } };
+    const [user, d] = await Promise.all([use('user'), use('db')]);
+    if (user) { try { canWrite = await user.can('data.write'); } catch (e) {} }
+    db = d;
+    if (!db) {
+      try { for (const [k, v] of JSON.parse(localStorage.getItem('trax-flags') || '[]')) { flags.set(+k, v); if (v && v.note) lastNote.set(+k, v.note); } } catch (e) {}
+      setStatus('Flags are saved only in this browser here. Open the page on claude.ai to have them saved for Claude to read.');
+      setReady(); return;
+    }
+    if (canWrite === false) setStatus('You can look, but flags cannot be saved from this account.', true);
+    let first = true;
+    db.collection('flags').onSnapshot(snap => {
+      lastSnap.clear();
+      for (const d of snap.docs) {
+        const b = d.data(); if (!b) continue;
+        let i = byKey.get(String(b.item) + '/' + String(b.file));
+        if (i == null && Number.isInteger(b.i) && b.i >= 0 && b.i < N) i = b.i;
+        if (i == null) continue;
+        lastSnap.set(i, b); if (b.note) lastNote.set(i, b.note);
+      }
+      mergeSnapshot();
+      if (first) { first = false; setReady(); } else refreshFlagUI();
+    }, e => { setStatus('Live flag updates stopped (' + ((e && e.code) || 'error') + '). Reload to reconnect.', true); setReady(); });
+    db.doc('progress/main').get().then(s => { const b = s.exists ? s.data() : null; if (b && +b.scanned > st.scanned) { st.scanned = +b.scanned; lastProgWritten = st.scanned; persistLocal(); renderCounts(); } }).catch(() => {});
+  }
+
+  // ---------- lightbox ----------
+  const lb = $('lb'), vO = $('v-o'), vC = $('v-c'), wrap = $('wrap');
+  const noteIn = $('lb-note'), qaEl = $('lb-qa');
+  let zoom = { o: false, c: false }, noteDirty = false, opener = null;
+  function lbSize() {
+    const stage = $('stage'), vert = window.innerWidth <= 720;
+    const availW = stage.clientWidth - (vert ? 0 : 12), availH = stage.clientHeight - (vert ? 12 : 0);
+    const s = Math.max(120, Math.floor(Math.min(vert ? availW : availW / 2, vert ? availH / 2 : availH)));
+    for (const v of [vO, vC]) { v.style.width = s + 'px'; v.style.height = s + 'px'; }
+    return s;
+  }
+  function navBase(d) { return st.open >= 0 ? st.open : (d > 0 ? st.ins - 1 : st.ins); } // virtual position when the open image left the list
+  function lbNav() {
+    $('lb-prev').disabled = navBase(-1) - 1 < 0; $('lb-next').disabled = navBase(1) + 1 >= st.list.length;
+  }
+  function lbRender() {
+    const i = st.openImg; if (i < 0) return;
+    const im = G.images[i], it = G.items[im[0]], s = lbSize();
+    $('lb-id').textContent = num(it);
+    $('lb-pos').textContent = 'image ' + pos[i] + ' of ' + itemCount[im[0]] + ' · ' + im[5] + '×' + im[6] + ' → 1200×1200';
+    $('lb-name').textContent = it + ' · ' + im[1];
+    for (const [v, solo] of [[vO, false], [vC, true]]) {
+      const el = v.querySelector('.img'); const { col, row } = slot(i), sc = s / T;
+      el.style.backgroundImage = 'url("' + spriteUrl(i) + '")';
+      el.style.backgroundSize = (SW * sc) + 'px auto';
+      el.style.backgroundPosition = (-(col * 2 * T + (solo ? T : 0)) * sc) + 'px ' + (-(row * T) * sc) + 'px';
+      el.style.transform = ''; v.classList.remove('zoomed');
+    }
+    zoom = { o: false, c: false }; peeking = false;
+    vC.querySelector('.lab').textContent = 'Corrected'; vC.querySelector('.lab').classList.remove('peek');
+    const n = im[7]; qaEl.hidden = !(im[4] || n);
+    if (!qaEl.hidden) qaEl.innerHTML = '<b>My QA note (' + (im[4] === 2 ? 'major' : 'minor') + (im[8] ? ', written before this image was re-processed, so it may no longer apply' : '') + '):</b> ' + esc(n || 'flagged for a look, no note');
+    lbFlagUI(); lbNav();
+  }
+  function lbFlagUI() {
+    const i = st.openImg, b = $('lb-flag'), on = flags.has(i);
+    b.classList.toggle('on', on); b.textContent = on ? 'Flagged as problem (F to undo)' : 'Flag as problem (F)';
+    b.disabled = !st.ready; b.hidden = canWrite === false; noteIn.hidden = canWrite === false; noteIn.disabled = !st.ready;
+    // never overwrite what the reviewer is typing; a focused but untouched field follows the store
+    if (noteIn.dataset.i !== String(i) || !(document.activeElement === noteIn && noteDirty)) {
+      noteIn.value = on ? (flags.get(i).note || '') : (lastNote.get(i) || ''); noteIn.dataset.i = String(i); noteDirty = false;
+    }
+  }
+  function openLb(i) {
+    opener = document.activeElement;
+    st.openImg = i; st.open = st.list.indexOf(i); if (st.open < 0) { st.ins = st.list.findIndex(x => x > i); if (st.ins < 0) st.ins = st.list.length; }
+    lb.hidden = false; document.body.style.overflow = 'hidden';
+    bar.inert = true; wrap.inert = true; bar.setAttribute('aria-hidden', 'true'); wrap.setAttribute('aria-hidden', 'true');
+    lbRender(); $('lb-close').focus();
+  }
+  function closeLb() {
+    flushNote();
+    const i = st.openImg; st.openImg = -1; st.open = -1; lb.hidden = true; document.body.style.overflow = '';
+    bar.inert = false; wrap.inert = false; bar.removeAttribute('aria-hidden'); wrap.removeAttribute('aria-hidden');
+    const t = grid.querySelector('.tile[data-i="' + i + '"] .pair') || (opener && opener.isConnected ? opener : null);
+    if (t) t.focus({ preventScroll: true }); else grid.focus({ preventScroll: true });
+    opener = null;
+  }
+  function step(d) { const n = navBase(d) + d; if (n >= 0 && n < st.list.length) { flushNote(); st.open = n; st.openImg = st.list[n]; lbRender(); } }
+  $('lb-close').addEventListener('click', closeLb);
+  $('lb-prev').addEventListener('click', () => step(-1));
+  $('lb-next').addEventListener('click', () => step(1));
+  $('lb-flag').addEventListener('click', () => { clearTimeout(noteTimer); noteDirty = false; toggleFlag(st.openImg, noteIn.value.trim()); });
+  let noteTimer = 0;
+  function flushNote() {
+    clearTimeout(noteTimer);
+    if (!noteDirty) return;
+    const i = +noteIn.dataset.i; if (!(i >= 0) || i !== st.openImg) return;
+    const v = noteIn.value.trim(); noteDirty = false;
+    if (v) lastNote.set(i, v);
+    if (flags.has(i) && (flags.get(i).note || '') !== v) writeFlag(i, true, v);
+  }
+  noteIn.addEventListener('input', () => { noteDirty = true; clearTimeout(noteTimer); noteTimer = setTimeout(flushNote, 600); });
+  noteIn.addEventListener('blur', flushNote);
+  // hold to peek at the original in the corrected slot; a short click zooms at that spot
+  let peeking = false, peekTimer = 0;
+  for (const [v, k] of [[vO, 'o'], [vC, 'c']]) {
+    let down = null;
+    v.addEventListener('pointerdown', e => {
+      if (e.button !== 0) return;
+      down = { x: e.clientX, y: e.clientY, t: Date.now(), id: e.pointerId };
+      try { v.setPointerCapture(e.pointerId); } catch (err) {}
+      if (k === 'c') { clearTimeout(peekTimer); peekTimer = setTimeout(() => { if (down) peek(true); }, 150); }
+    });
+    const end = e => {
+      if (!down || (e.pointerId != null && e.pointerId !== down.id)) return;
+      clearTimeout(peekTimer);
+      const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6, held = peeking || Date.now() - down.t > 350; down = null;
+      if (k === 'c') peek(false);
+      if (moved || held || e.type !== 'pointerup') return;
+      const el = v.querySelector('.img'), r = v.getBoundingClientRect();
+      zoom[k] = !zoom[k];
+      el.style.transformOrigin = ((e.clientX - r.left) / r.width * 100) + '% ' + ((e.clientY - r.top) / r.height * 100) + '%';
+      el.style.transform = zoom[k] ? 'scale(2.5)' : ''; v.classList.toggle('zoomed', zoom[k]);
+    };
+    v.addEventListener('pointerup', end);
+    v.addEventListener('pointercancel', end);
+  }
+  function peek(on) { // show the original in the corrected slot
+    const i = st.openImg; if (i < 0 || peeking === on) return; peeking = on;
+    const el = vC.querySelector('.img'), { col, row } = slot(i), s = vC.clientWidth, sc = s / T;
+    el.style.backgroundPosition = (-(col * 2 * T + (on ? 0 : T)) * sc) + 'px ' + (-(row * T) * sc) + 'px';
+    const lab = vC.querySelector('.lab'); lab.textContent = on ? 'Original (hold)' : 'Corrected'; lab.classList.toggle('peek', on);
+  }
+  document.addEventListener('keydown', e => {
+    if (lb.hidden || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === 'Escape') { closeLb(); return; }
+    if (e.target && e.target.matches && e.target.matches('input,textarea')) return;
+    if (e.key === 'ArrowRight') step(1);
+    else if (e.key === 'ArrowLeft') step(-1);
+    else if ((e.key === 'f' || e.key === 'F') && !e.repeat) { clearTimeout(noteTimer); noteDirty = false; toggleFlag(st.openImg, noteIn.value.trim()); }
+    else if ((e.key === 'o' || e.key === 'O') && !e.repeat) peek(true);
+  });
+  document.addEventListener('keyup', e => { if (!lb.hidden && (e.key === 'o' || e.key === 'O')) peek(false); });
+  if (!('inert' in HTMLElement.prototype)) document.addEventListener('focusin', e => { if (!lb.hidden && !lb.contains(e.target)) $('lb-close').focus(); });
+
+  // ---------- boot ----------
+  refilter();
+  connect().catch(() => { setStatus('Flag saving is unavailable (connection error).', true); setReady(); });
+})();
+</script>
